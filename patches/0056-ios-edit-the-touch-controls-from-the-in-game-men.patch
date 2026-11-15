@@ -1,0 +1,627 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fork contributor <contributor@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 12:26:04 +0000
+Subject: [PATCH] ios: edit the touch controls from the in-game menu (move,
+ size, opacity)
+
+Adds Edit control layout to the in-game menu (GameMenu.swift). It opens a layout editor over the
+game: drag any control to move it (DM_TOUCH_LAYOUT's steps, kept inside its area and clear of the
+others), one size slider for every control, an opacity slider, a switch to move the A B X Y keys
+one by one, Reset, Cancel and Done. Done saves the arrangement, the size and the opacity in
+NSUserDefaults, so a game's own app, which has no launcher to edit them in, keeps them.
+Saved edits are dropped when DM_TOUCH_LAYOUT or DM_TOUCH_SIZE in the environment changes.
+
+DmPadGeometry.h gains dm_pad_layout_encode and dm_pad_control_ref, tested on the Mac in
+pad_geometry_check.m.
+
+Upstream-Status: pending
+Reason: Let a game's own app (no launcher) edit the touch controls in game: move, size, opacity
+Issue: none
+
+---
+ dm/ios/Sources/DmGameMenu.h                   |   4 +-
+ dm/ios/Sources/DmGamepad.m                    | 285 +++++++++++++++++-
+ dm/ios/Sources/DmPadGeometry.h                |  37 +++
+ dm/ios/Sources/GameMenu.swift                 |  17 +-
+ .../tests/pad_geometry/pad_geometry_check.m   |  69 +++++
+ 5 files changed, 402 insertions(+), 10 deletions(-)
+
+diff --git a/dm/ios/Sources/DmGameMenu.h b/dm/ios/Sources/DmGameMenu.h
+index a7e9c69..0185b6b 100644
+--- a/dm/ios/Sources/DmGameMenu.h
++++ b/dm/ios/Sources/DmGameMenu.h
+@@ -1,4 +1,4 @@
+-// The in-game menu: GameMenu.swift builds it, the gamepad's menu button at the top centre opens it (DmGamepad.m). It holds the controller layout and the launcher
++// The in-game menu: GameMenu.swift builds it, the gamepad's menu button at the top centre opens it (DmGamepad.m). It holds the controller layout, the layout editor and the launcher
+ // settings the running game takes at once (front_ios.m dm_setting_live); the other settings stay on the settings screen before the game starts.
+ #pragma once
+ #include <stdbool.h>
+@@ -10,6 +10,8 @@ void *dm_game_menu(void);   // GameMenu.swift: a retained UIMenu, rebuilt each t
+ int dm_pad_layout(void);   // DmGamepad.m: 0 = 2D, 1 = 3D, 2 = Tap (DM_GAME_PAD_LAYOUT's numbers)
+ bool dm_pad_layout_offered(int layout);   // Tap only in handheld mode
+ void dm_pad_layout_set(int layout);   // releases every touch first, and is saved for the next start
++bool dm_pad_edit_offered(void);   // the layout editor needs controls on screen: not in the Tap layout
++void dm_pad_edit_begin(void);   // DmGamepad.m: opens the in-game layout editor (move, size, opacity), saved when Done is tapped
+ void dm_gamepad_touch_feedback(bool on);   // DM_TOUCH_HAPTICS
+ bool dm_setting_live(const char *env, const char *value);
+ void *dm_quit_menu(void);   // front_ios.m: the menu's last item, Quit <game>, which opens the quit prompt (a retained UIMenu, shown inline)   // front_ios.m: value NULL asks whether the running game takes env at once; otherwise applies it
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index 9860743..ee6ebb4 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -127,6 +127,10 @@ static const CGFloat                               // (the grab radii of the sti
+     K_RSWIPE = 1.0 / 3,                             // right stick area: this fraction of the screen width from the right edge (not in u)
+     K_MENU_IDLE = 3.0;                              // seconds a connected controller leaves the menu gear visible before fading it out
+ static const int k_btns[] = {B_ZL, B_L, B_ZR, B_R, B_MINUS, B_PLUS, B_LS, B_RS};   // keys locked at touch-down (L3 / R3 only in the 3D layout)
++// The layout editor's saves (NSUserDefaults): the arrangement as DM_TOUCH_LAYOUT's text, the size as a factor of the built-in one, the opacity of the controls (1 = as built), and the
++// DM_TOUCH_LAYOUT and DM_TOUCH_SIZE the environment held when they were saved: when the shell's own settings change those, the saved edits are dropped and the shell's win.
++static NSString *const k_edit_layout_key = @"DmPadEditLayout", *const k_edit_scale_key = @"DmPadEditScale", *const k_edit_opacity_key = @"DmPadEditOpacity", *const k_edit_stamp_key = @"DmPadEditStamp";
++static const CGFloat k_edit_scale_min = 0.6, k_edit_scale_max = 1.4, k_edit_opacity_min = 0.2;
+ static NSString *const k_layout_key = @"DmPadLayout";   // NSUserDefaults: 0 = 2D, 1 = 3D, 2 = Tap (DM_GAME_PAD_LAYOUT's numbers)
+ int dm_opmode(void);   // hle_oe.c: 0 = handheld
+ void front_ios_quit_poll(void);          // front_ios.m: a controller's buttons changed (the Home hold, A and B in the quit prompt)
+@@ -141,6 +145,7 @@ void front_ios_quit_controllers(void);   // front_ios.m: the controllers changed
+ - (BOOL)reduceMotionEnabled;
+ - (void)wakeMenu;
+ - (void)setMenuOpen:(BOOL)open;
++- (void)editPlaceCard;
+ @end
+ // The menu button: a UIButton whose menu is the in-game menu (UIKit draws it and takes the touches while it is open). Its hit circle is larger than the drawn one, and a key nearer
+ // to the touch wins (− / + sit beside it), so it asks the pad
+@@ -156,6 +161,108 @@ void front_ios_quit_controllers(void);   // front_ios.m: the controllers changed
+     [super contextMenuInteraction:i willEndForConfiguration:c animator:a]; [(DmGamepad *)self.superview setMenuOpen:NO];
+ }
+ @end
++
++// The layout editor's card (DmGamepad.m, "Edit control layout" in the in-game menu): a size slider, an opacity slider, a switch that lets the keys of the A B X Y
++// diamond move one by one, and Reset, Cancel and Done. The title is a grip: dragging it moves the card out of the way of a control. The words are English.
++@interface DmPadEditCard : UIView
++@property (nonatomic, copy) void (^onSize)(CGFloat);
++@property (nonatomic, copy) void (^onOpacity)(CGFloat);
++@property (nonatomic, copy) void (^onApart)(BOOL);
++@property (nonatomic, copy) void (^onReset)(void);
++@property (nonatomic, copy) void (^onCancel)(void);
++@property (nonatomic, copy) void (^onDone)(void);
++- (instancetype)initWithScale:(CGFloat)scale opacity:(CGFloat)opacity min:(CGFloat)smin max:(CGFloat)smax opacityMin:(CGFloat)omin;
++- (void)setScale:(CGFloat)scale opacity:(CGFloat)opacity;
++- (CGSize)fittedSizeForWidth:(CGFloat)w;
++@end
++@implementation DmPadEditCard {
++    UISlider *_size, *_opacity; UILabel *_sizeValue, *_opacityValue; UISwitch *_apart;
++}
++static UILabel *edit_label(NSString *text, CGFloat size, UIFontWeight weight, CGFloat alpha) {
++    UILabel *l = [UILabel new]; l.text = text; l.font = [UIFont systemFontOfSize:size weight:weight]; l.textColor = [UIColor colorWithWhite:1 alpha:alpha]; l.numberOfLines = 0;
++    return l;
++}
++- (UIStackView *)rowNamed:(NSString *)name slider:(UISlider *)slider value:(UILabel *)value {
++    UILabel *n = edit_label(name, 13, UIFontWeightMedium, 0.85);
++    [n.widthAnchor constraintEqualToConstant:62].active = YES;
++    value.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightRegular]; value.textAlignment = NSTextAlignmentRight;
++    [value.widthAnchor constraintEqualToConstant:44].active = YES;
++    UIStackView *r = [[UIStackView alloc] initWithArrangedSubviews:@[n, slider, value]]; r.axis = UILayoutConstraintAxisHorizontal; r.spacing = 8; r.alignment = UIStackViewAlignmentCenter;
++    return r;
++}
++- (UIButton *)button:(NSString *)title style:(int)style action:(void (^)(void))block {
++    UIButtonConfiguration *c = style == 2 ? [UIButtonConfiguration filledButtonConfiguration] : style == 1 ? [UIButtonConfiguration tintedButtonConfiguration] : [UIButtonConfiguration plainButtonConfiguration];
++    c.title = title; c.buttonSize = UIButtonConfigurationSizeSmall; c.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
++    if (style == 0) c.baseForegroundColor = [UIColor colorWithRed:1 green:0.45 blue:0.4 alpha:1];
++    return [UIButton buttonWithConfiguration:c primaryAction:[UIAction actionWithHandler:^(UIAction *a) { (void)a; if (block) block(); }]];
++}
++- (instancetype)initWithScale:(CGFloat)scale opacity:(CGFloat)opacity min:(CGFloat)smin max:(CGFloat)smax opacityMin:(CGFloat)omin {
++    if ((self = [super initWithFrame:CGRectZero])) {
++        self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
++        self.backgroundColor = [UIColor colorWithRed:0.10 green:0.10 blue:0.11 alpha:0.96]; self.layer.cornerRadius = 20;
++        self.layer.borderWidth = 1; self.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
++        self.layer.shadowColor = UIColor.blackColor.CGColor; self.layer.shadowOpacity = 0.4; self.layer.shadowRadius = 14; self.layer.shadowOffset = CGSizeMake(0, 4);
++        __weak DmPadEditCard *weak = self;
++
++        UIStackView *head = [[UIStackView alloc] initWithArrangedSubviews:@[edit_label(@"Edit control layout", 15, UIFontWeightBold, 1), edit_label(@"Drag a control to move it. Drag here to move this card.", 12, UIFontWeightRegular, 0.6)]];
++        head.axis = UILayoutConstraintAxisVertical; head.spacing = 2;
++        UIView *grip = [UIView new]; head.translatesAutoresizingMaskIntoConstraints = NO; [grip addSubview:head];
++        [NSLayoutConstraint activateConstraints:@[[head.topAnchor constraintEqualToAnchor:grip.topAnchor], [head.bottomAnchor constraintEqualToAnchor:grip.bottomAnchor],
++                                                  [head.leadingAnchor constraintEqualToAnchor:grip.leadingAnchor], [head.trailingAnchor constraintEqualToAnchor:grip.trailingAnchor]]];
++        [grip addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
++
++        _size = [UISlider new]; _size.minimumValue = smin; _size.maximumValue = smax; _size.value = scale;
++        _sizeValue = edit_label(@"", 13, UIFontWeightRegular, 0.85);
++        [_size addTarget:self action:@selector(sizeChanged) forControlEvents:UIControlEventValueChanged];
++        _opacity = [UISlider new]; _opacity.minimumValue = omin; _opacity.maximumValue = 1; _opacity.value = opacity;
++        _opacityValue = edit_label(@"", 13, UIFontWeightRegular, 0.85);
++        [_opacity addTarget:self action:@selector(opacityChanged) forControlEvents:UIControlEventValueChanged];
++
++        UILabel *apartName = edit_label(@"Move A B X Y keys one by one", 13, UIFontWeightMedium, 0.85);
++        _apart = [UISwitch new]; [_apart addTarget:self action:@selector(apartChanged) forControlEvents:UIControlEventValueChanged];
++        [_apart setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
++        UIStackView *apartRow = [[UIStackView alloc] initWithArrangedSubviews:@[apartName, _apart]]; apartRow.axis = UILayoutConstraintAxisHorizontal; apartRow.spacing = 8; apartRow.alignment = UIStackViewAlignmentCenter;
++
++        UIView *spacer = [UIView new]; [spacer setContentHuggingPriority:UILayoutPriorityDefaultLow - 1 forAxis:UILayoutConstraintAxisHorizontal];   // the gap takes the slack, the buttons stay their size
++        UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[
++            [self button:@"Reset" style:0 action:^{ if (weak.onReset) weak.onReset(); }], spacer,
++            [self button:@"Cancel" style:1 action:^{ if (weak.onCancel) weak.onCancel(); }],
++            [self button:@"Done" style:2 action:^{ if (weak.onDone) weak.onDone(); }]]];
++        buttons.axis = UILayoutConstraintAxisHorizontal; buttons.spacing = 8; buttons.alignment = UIStackViewAlignmentCenter;
++
++        UIStackView *all = [[UIStackView alloc] initWithArrangedSubviews:@[grip, [self rowNamed:@"Size" slider:_size value:_sizeValue], [self rowNamed:@"Opacity" slider:_opacity value:_opacityValue], apartRow, buttons]];
++        all.axis = UILayoutConstraintAxisVertical; all.spacing = 10; all.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:all];
++        [NSLayoutConstraint activateConstraints:@[[all.topAnchor constraintEqualToAnchor:self.topAnchor constant:14], [all.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-12],
++                                                  [all.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16], [all.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16]]];
++        [self showValues];
++    }
++    return self;
++}
++- (void)showValues {
++    _sizeValue.text = [NSString stringWithFormat:@"%d%%", (int)lround(_size.value * 100)];
++    _opacityValue.text = [NSString stringWithFormat:@"%d%%", (int)lround(_opacity.value * 100)];
++}
++- (void)setScale:(CGFloat)scale opacity:(CGFloat)opacity { _size.value = scale; _opacity.value = opacity; [self showValues]; }
++- (void)sizeChanged {
++    if (fabs(_size.value - 1) < 0.025) _size.value = 1;   // the built-in size catches
++    [self showValues]; if (self.onSize) self.onSize(_size.value);
++}
++- (void)opacityChanged {
++    if (_opacity.value > 0.975) _opacity.value = 1;
++    [self showValues]; if (self.onOpacity) self.onOpacity(_opacity.value);
++}
++- (void)apartChanged { if (self.onApart) self.onApart(_apart.isOn); }
++- (void)pan:(UIPanGestureRecognizer *)g {
++    UIView *sv = self.superview; if (!sv) return;
++    CGPoint t = [g translationInView:sv];
++    self.center = CGPointMake(self.center.x + t.x, self.center.y + t.y); [g setTranslation:CGPointZero inView:sv];
++    [(DmGamepad *)sv editPlaceCard];
++}
++- (CGSize)fittedSizeForWidth:(CGFloat)w {
++    CGSize s = [self systemLayoutSizeFittingSize:CGSizeMake(w, UILayoutFittingCompressedSize.height) withHorizontalFittingPriority:UILayoutPriorityRequired verticalFittingPriority:UILayoutPriorityFittingSizeLevel];
++    return CGSizeMake(w, ceil(s.height));
++}
++@end
+ static __weak DmGamepad *g_view;
+ static void pads_start(void);   // Physical controllers, below
+ 
+@@ -185,6 +292,13 @@ static void pads_start(void);   // Physical controllers, below
+     DmPadGeo _geo; CGRect _geoBounds; UIEdgeInsets _geoInsets; BOOL _geoFull, _geoValid;   // where the controls are, and what it was computed for
+     unsigned _loggedDropped;                       // the moved controls that kept their place, as last logged
+     UITouch *_game[16];                           // touches on the game's touch screen by finger slot
++    CGFloat _opacity;                              // the controls' opacity (1 = as built; the layout editor's slider), applied to _controls
++    BOOL _editing, _editApart;                     // the layout editor is open / the diamond's keys move one by one
++    DmPadEditCard *_editCard; BOOL _editCardPlaced;
++    CALayer *_editScrim; CAShapeLayer *_editHalo;  // the dimmed picture behind the controls, the dashed outline of the selected control
++    int _editSel, _editControl;                    // the selected control (DM_PAD_C_*, -1 none), the one the finger holds
++    UITouch *_editTouch; CGPoint _editGrab, _editStartPos, _editBase;   // the finger, where it landed, where the control was, where it sits with no move of its own
++    DmPadLayout _editStart; CGFloat _editStartScale, _editStartOpacity; // what Cancel goes back to
+ }
+ 
+ static UIColor *k_idle, *k_on, *k_line, *k_ringFill, *k_text, *k_textOn;
+@@ -213,7 +327,8 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+         const char *arrangement = getenv("DM_TOUCH_LAYOUT");
+         if (!dm_pad_layout_parse(arrangement, &_arrangement)) LOG("front end: DM_TOUCH_LAYOUT ignored (not a layout the engine reads, %zu characters): every control keeps its place", strlen(arrangement));
+         else if (dm_pad_layout_count(&_arrangement)) LOG("front end: touch controls arranged by the player (DM_TOUCH_LAYOUT, %d moved over every layout)", dm_pad_layout_count(&_arrangement));
+-        _opts.layout = &_arrangement;
++        _opts.layout = &_arrangement; _opacity = 1;
++        [self loadEdits];
+         [self registerForTraitChanges:@[UITraitDisplayScale.class] withHandler:^(id<UITraitEnvironment> environment, UITraitCollection *previous) {
+             [(UIView *)environment setNeedsLayout];
+         }];
+@@ -230,6 +345,7 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+             k_ringFill = [UIColor colorWithWhite:1 alpha:0.06]; k_text = [UIColor colorWithWhite:1 alpha:0.6]; k_textOn = [UIColor colorWithWhite:0 alpha:0.7];
+         }
+         _controls = [CALayer layer]; [self.layer addSublayer:_controls];
++        _controls.allowsGroupOpacity = NO; _controls.opacity = _opacity;   // each shape fades by itself: no off-screen pass for the full-screen layer
+         _ring = shape(_controls); _ring.fillColor = k_ringFill.CGColor;
+         _knob = shape(_controls);
+         CAShapeLayer *in = [CAShapeLayer layer]; in.fillColor = nil; in.strokeColor = k_line.CGColor; in.lineWidth = 1.5;   // inner ring of the knob
+@@ -314,7 +430,7 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+     if (!_geoValid || !CGRectEqualToRect(b, _geoBounds) || !UIEdgeInsetsEqualToEdgeInsets(i, _geoInsets) || _geoFull != _full) {
+         _geo = dm_pad_geo(b, i, _layout, _full, _opts);
+         _geoBounds = b; _geoInsets = i; _geoFull = _full; _geoValid = YES;
+-        if (_geo.dropped != _loggedDropped) {   // a moved control with no room on this screen: said once per change, for the log a player sends
++        if (!_editing && _geo.dropped != _loggedDropped) {   // a moved control with no room on this screen: said once per change, for the log a player sends
+             _loggedDropped = _geo.dropped;
+             NSMutableArray<NSString *> *names = [NSMutableArray array];
+             for (int c = 0; c < DM_PAD_C_N; c++) if (_geo.dropped & (1u << c)) [names addObject:@(dm_pad_control_names[c])];
+@@ -443,6 +559,7 @@ int front_web_touch(void);
+     return v;
+ }
+ - (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
++    if (_editing) { [self editBegan:ts]; return; }
+     if (_padOff && !_layout.onTV) [self wakeMenu];
+     BOOL game = NO;
+     for (UITouch *t in ts) {
+@@ -463,6 +580,7 @@ int front_web_touch(void);
+     [self recompute];
+ }
+ - (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
++    if (_editing) { [self editMoved:ts]; return; }
+     BOOL game = NO;
+     for (UITouch *t in ts) {
+         uint64_t v = [_owner objectForKey:t].unsignedLongLongValue; int c = (int)(v & 0xff); CGPoint p = [t locationInView:self];
+@@ -485,8 +603,8 @@ int front_web_touch(void);
+     if (game) [self pushGame];
+     [self recompute];
+ }
+-- (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self endTouches:ts tapped:YES]; }
+-- (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self endTouches:ts tapped:NO]; }
++- (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { if (_editing) { [self editEnded:ts]; return; } [self endTouches:ts tapped:YES]; }
++- (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { if (_editing) { [self editEnded:ts]; return; } [self endTouches:ts tapped:NO]; }
+ - (void)reset { [_owner removeAllObjects]; [_faceOf removeAllObjects]; _stick[0] = _stick[1] = nil; for (int i = 0; i < 16; i++) _game[i] = nil; [self pushGame]; [self recompute]; }
+ 
+ // ---- Shapes ----
+@@ -553,12 +671,167 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
+     CAShapeLayer *in = (CAShapeLayer *)_knob.sublayers.firstObject; CGPathRef ip = circlePath(CGPointMake(k, k), k * 0.62);
+     in.frame = _knob.bounds; in.path = ip; CGPathRelease(ip);
+     [CATransaction commit];
++    if (_editing) [self editLayout];
+     [self placeHint];
+     if (!_padHint.hidden) [self placePadHint];
+     else if (_padOff && !_layout.onTV && !_menuOpen && ![self voiceOverRunning] && !_padHintShown && _padHintWords.length && !CGRectIsEmpty(self.bounds)) [self wakeMenu];
+     [self refresh];
+ }
+ 
++// ---- Editing the layout in the game ----
++// "Edit control layout" in the in-game menu (GameMenu.swift, dm_pad_edit_begin) works in a game's own app, which has no shell and so no layout editor of its own, as in the shell.
++// The picture dims, every control of the current layout (2D or 3D) can be dragged to where the player wants it, and a card holds one size for all the controls (DM_TOUCH_SIZE's
++// factor, continuous), one opacity and Reset, Cancel and Done. The moves are the shell editor's: DM_TOUCH_LAYOUT's steps, a quarter of a face key's width each, and the geometry
++// (DmPadGeometry.h) keeps a control inside its area and clear of the others, so a drag that has no room stops at the last place that has (it slides along what blocks it).
++// Done saves the arrangement, the size and the opacity in NSUserDefaults (loadEdits reads them at the next start). A change of DM_TOUCH_LAYOUT or DM_TOUCH_SIZE in the environment
++// (the shell's settings) after that drops the saved edits. Touches belong to the editor while it is open: no key is pressed and nothing reaches the game.
++static NSString *edit_env_stamp(void) {
++    const char *l = getenv("DM_TOUCH_LAYOUT"), *s = getenv("DM_TOUCH_SIZE");
++    return [NSString stringWithFormat:@"%s|%s", l ? l : "", s ? s : ""];
++}
++- (void)loadEdits {
++    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
++    NSString *stamp = [d stringForKey:k_edit_stamp_key];
++    if (!stamp) return;
++    if (![stamp isEqualToString:edit_env_stamp()]) {   // the shell's settings changed since: its values win
++        for (NSString *k in @[k_edit_layout_key, k_edit_scale_key, k_edit_opacity_key, k_edit_stamp_key]) [d removeObjectForKey:k];
++        LOG("front end: saved layout edits dropped (DM_TOUCH_LAYOUT or DM_TOUCH_SIZE changed)");
++        return;
++    }
++    NSString *text = [d stringForKey:k_edit_layout_key]; DmPadLayout l;
++    if (text && dm_pad_layout_parse(text.UTF8String, &l)) _arrangement = l;
++    double scale = [d doubleForKey:k_edit_scale_key], opacity = [d doubleForKey:k_edit_opacity_key];
++    if (scale >= k_edit_scale_min && scale <= k_edit_scale_max) _opts.scale = scale;
++    if (opacity >= k_edit_opacity_min && opacity <= 1) _opacity = opacity;
++    LOG("front end: touch layout edits loaded (size %.0f%%, opacity %.0f%%, %d moved)", _opts.scale * 100, _opacity * 100, dm_pad_layout_count(&_arrangement));
++}
++- (BOOL)editOffered { return !_tap; }
++- (int)editSet { return (_layout.separated ? DM_PAD_SET_2D_SPLIT : DM_PAD_SET_2D) + (_full ? 1 : 0); }
++- (void)beginEditing {
++    if (_editing || _tap) return;
++    [self reset];
++    _editing = YES; _editSel = -1; _editControl = -1; _editTouch = nil; _editApart = NO; _editCardPlaced = NO;
++    _editStart = _arrangement; _editStartScale = _opts.scale > 0 ? _opts.scale : 1; _editStartOpacity = _opacity;
++    _editScrim = [CALayer layer]; _editScrim.backgroundColor = [UIColor colorWithWhite:0 alpha:0.4].CGColor; [self.layer insertSublayer:_editScrim atIndex:0];
++    _editHalo = [CAShapeLayer layer]; _editHalo.fillColor = nil; _editHalo.strokeColor = [UIColor colorWithWhite:1 alpha:0.95].CGColor; _editHalo.lineWidth = 2;
++    _editHalo.lineDashPattern = @[@7, @5]; _editHalo.hidden = YES; [self.layer addSublayer:_editHalo];
++    _controls.hidden = NO; _menu.userInteractionEnabled = NO;   // the menu button cannot move: it stays, and does nothing, until the editor closes
++    __weak DmGamepad *weak = self;
++    DmPadEditCard *card = [[DmPadEditCard alloc] initWithScale:_editStartScale opacity:_opacity min:k_edit_scale_min max:k_edit_scale_max opacityMin:k_edit_opacity_min];
++    card.onSize = ^(CGFloat v) { [weak editSetScale:v]; };
++    card.onOpacity = ^(CGFloat v) { [weak editSetOpacity:v]; };
++    card.onApart = ^(BOOL on) { DmGamepad *s = weak; if (s) { s->_editApart = on; s->_editSel = -1; [s setNeedsLayout]; } };
++    card.onReset = ^{ [weak editReset]; };
++    card.onCancel = ^{ [weak endEditing:NO]; };
++    card.onDone = ^{ [weak endEditing:YES]; };
++    _editCard = card; [self addSubview:card];
++    LOG("front end: touch layout editor opened");
++    [self setNeedsLayout];
++}
++- (void)editSetScale:(CGFloat)v { _opts.scale = v; _geoValid = NO; [self setNeedsLayout]; }
++- (void)editSetOpacity:(CGFloat)v {
++    _opacity = v;
++    [CATransaction begin]; [CATransaction setDisableActions:YES]; _controls.opacity = v; [CATransaction commit];
++}
++- (void)editReset {   // the current layout's controls back in their built-in places, the built-in size, full opacity
++    int set = [self editSet];
++    for (int c = 0; c < DM_PAD_C_N; c++) { _arrangement.dx[set][c] = 0; _arrangement.dy[set][c] = 0; }
++    _opts.scale = 1; [self editSetOpacity:1]; [_editCard setScale:1 opacity:1];
++    _editSel = -1; _geoValid = NO; [self setNeedsLayout];
++}
++- (void)endEditing:(BOOL)save {
++    if (!_editing) return;
++    if (save) {
++        char text[DM_PAD_LAYOUT_MAX + 1];
++        if (dm_pad_layout_encode(&_arrangement, text, sizeof text) >= 0) {
++            NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
++            [d setObject:@(text) forKey:k_edit_layout_key]; [d setDouble:_opts.scale forKey:k_edit_scale_key]; [d setDouble:_opacity forKey:k_edit_opacity_key];
++            [d setObject:edit_env_stamp() forKey:k_edit_stamp_key];
++            LOG("front end: touch layout saved (size %.0f%%, opacity %.0f%%, %d moved)", _opts.scale * 100, _opacity * 100, dm_pad_layout_count(&_arrangement));
++        } else save = NO;
++    }
++    if (!save) { _arrangement = _editStart; _opts.scale = _editStartScale; [self editSetOpacity:_editStartOpacity]; LOG("front end: touch layout editor closed without saving"); }
++    _editing = NO; _editTouch = nil; _editSel = -1;
++    [_editCard removeFromSuperview]; _editCard = nil;
++    [_editScrim removeFromSuperlayer]; _editScrim = nil; [_editHalo removeFromSuperlayer]; _editHalo = nil;
++    _menu.userInteractionEnabled = YES; _controls.hidden = _padOff;
++    _geoValid = NO; [self setNeedsLayout]; [self wakeMenu];
++}
++static CGFloat edit_shape_distance(const DmPadShape *s, CGPoint p) {   // from p to the shape's outline, 0 inside it
++    if (s->isRect) return hypot(p.x - fmax(CGRectGetMinX(s->rect), fmin(p.x, CGRectGetMaxX(s->rect))), p.y - fmax(CGRectGetMinY(s->rect), fmin(p.y, CGRectGetMaxY(s->rect))));
++    return fmax(0, hypot(p.x - s->c.x, p.y - s->c.y) - s->r);
++}
++- (BOOL)editMovable:(int)c {   // the diamond as one control, or its four keys on their own
++    BOOL key = c >= DM_PAD_C_A && c <= DM_PAD_C_Y;
++    if (!dm_pad_control_drawn(c, _full)) return NO;
++    return c == DM_PAD_C_FACE ? !_editApart : key ? _editApart : YES;
++}
++- (int)editControlAt:(CGPoint)p {   // the control nearest to p, within 16 points of its outline
++    DmPadShape s[20]; int n = dm_pad_shapes(self.geo, _full, s), best = -1; CGFloat bd = 16;
++    for (int c = 0; c < DM_PAD_C_N; c++) {
++        if (![self editMovable:c]) continue;
++        for (int i = 0; i < n; i++) if (dm_pad_is_shape_of(s[i].id, c)) { CGFloat d = edit_shape_distance(&s[i], p); if (d < bd) { bd = d; best = c; } }
++    }
++    return best;
++}
++- (CGRect)editBox:(int)c {
++    DmPadShape s[20]; int n = dm_pad_shapes(self.geo, _full, s); CGRect box = CGRectNull;
++    for (int i = 0; i < n; i++) if (dm_pad_is_shape_of(s[i].id, c)) box = CGRectUnion(box, dm_pad_shape_box(&s[i]));
++    return box;
++}
++- (void)editBegan:(NSSet<UITouch *> *)ts {
++    if (_editTouch) return;
++    UITouch *t = ts.anyObject; CGPoint p = [t locationInView:self];
++    int c = [self editControlAt:p];
++    if (c < 0) { if (_editSel >= 0) { _editSel = -1; [self setNeedsLayout]; } return; }
++    int set = [self editSet];
++    DmPadLayout none = _arrangement; none.dx[set][c] = 0; none.dy[set][c] = 0;   // where the control sits with no move of its own: the drag is measured from there
++    DmPadOptions o = _opts; o.layout = &none;
++    DmPadGeo base = dm_pad_geo(self.bounds, self.safeAreaInsets, _layout, _full, o);
++    _editBase = dm_pad_control_ref(&base, c); _editStartPos = dm_pad_control_ref(self.geo, c);
++    _editTouch = t; _editControl = c; _editGrab = p; _editSel = c;
++    [self setNeedsLayout];
++}
++- (void)editMoved:(NSSet<UITouch *> *)ts {
++    if (!_editTouch || ![ts containsObject:_editTouch]) return;
++    int c = _editControl, set = [self editSet];
++    CGFloat step = self.geo->faceR / 2; if (step <= 0) return;
++    CGPoint p = [_editTouch locationInView:self];
++    int wx = (int)lround((_editStartPos.x + p.x - _editGrab.x - _editBase.x) / step), wy = (int)lround((_editStartPos.y + p.y - _editGrab.y - _editBase.y) / step);
++    wx = MAX(-DM_PAD_STEP_MAX, MIN(DM_PAD_STEP_MAX, wx)); wy = MAX(-DM_PAD_STEP_MAX, MIN(DM_PAD_STEP_MAX, wy));
++    signed char ox = _arrangement.dx[set][c], oy = _arrangement.dy[set][c];
++    if (wx == ox && wy == oy) return;
++    const int tries[3][2] = {{wx, wy}, {wx, oy}, {ox, wy}};   // where the finger is, then sliding along what blocks it on either axis
++    for (int i = 0; i < 3; i++) {
++        _arrangement.dx[set][c] = (signed char)tries[i][0]; _arrangement.dy[set][c] = (signed char)tries[i][1]; _geoValid = NO;
++        if (!(self.geo->dropped & (1u << c))) { [self setNeedsLayout]; return; }
++    }
++    _arrangement.dx[set][c] = ox; _arrangement.dy[set][c] = oy; _geoValid = NO;   // no room anywhere on the way: it stays where it was
++}
++- (void)editEnded:(NSSet<UITouch *> *)ts { if (_editTouch && [ts containsObject:_editTouch]) { _editTouch = nil; _editControl = -1; } }
++- (void)editLayout {   // after every layout: the dim, the outline of the selected control, the card
++    [CATransaction begin]; [CATransaction setDisableActions:YES];
++    _editScrim.frame = self.layer.bounds;
++    CGRect box = _editSel >= 0 ? [self editBox:_editSel] : CGRectNull;
++    _editHalo.hidden = CGRectIsNull(box);
++    if (!CGRectIsNull(box)) {
++        CGRect r = CGRectInset(box, -7, -7);
++        CGPathRef path = CGPathCreateWithRoundedRect(r, fmin(14, fmin(r.size.width, r.size.height) / 2), fmin(14, fmin(r.size.width, r.size.height) / 2), NULL);
++        _editHalo.path = path; CGPathRelease(path);
++    }
++    [CATransaction commit];
++    [self editPlaceCard];
++}
++- (void)editPlaceCard {   // inside the safe area; centred the first time
++    if (!_editCard) return;
++    CGRect area = UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets); area = CGRectInset(area, 8, 8);
++    CGSize size = [_editCard fittedSizeForWidth:fmin(380, area.size.width)];
++    CGPoint centre = _editCardPlaced ? _editCard.center : CGPointMake(CGRectGetMidX(area), CGRectGetMidY(area));
++    centre.x = fmax(CGRectGetMinX(area) + size.width / 2, fmin(centre.x, CGRectGetMaxX(area) - size.width / 2));
++    centre.y = fmax(CGRectGetMinY(area) + size.height / 2, fmin(centre.y, CGRectGetMaxY(area) - size.height / 2));
++    _editCard.bounds = CGRectMake(0, 0, size.width, size.height); _editCard.center = centre; _editCardPlaced = YES;
++}
++
+ // ---- The right-stick hint ----
+ // The 3D layout's right stick is not drawn (it answers anywhere in the right third), and players read the layout as having none (GitHub issues #347, #414).
+ // So the first time the 3D layout shows in a launch, a few words say where it is, for two seconds, then fade. Words only: a ring or a knob would read as
+@@ -833,7 +1106,7 @@ static BOOL pads_slotted(GCController *gone) {
+     if (_padOff && !_layout.onTV) [self wakeMenu];
+ }
+ - (void)updateControlVisibility {
+-    _controls.hidden = _padOff;
++    _controls.hidden = _padOff && !_editing;   // the editor shows the controls even with a controller connected
+     if (_padOff && _layout.onTV) {
+         ++_menuGen; [_menu.layer removeAllAnimations];
+         _menu.alpha = 1; _menu.hidden = YES;
+@@ -961,6 +1234,8 @@ void dm_gamepad_touch_feedback(bool on) { [g_view setTouchFeedback:on]; }
+ int dm_pad_layout(void) { return g_view ? [g_view padLayout] : 0; }
+ bool dm_pad_layout_offered(int layout) { return layout == 0 || layout == 1 || (layout == 2 && dm_opmode() == 0); }
+ void dm_pad_layout_set(int layout) { [g_view setPadLayout:layout]; }
++bool dm_pad_edit_offered(void) { return g_view && [g_view editOffered]; }
++void dm_pad_edit_begin(void) { [g_view beginEditing]; }
+ void dm_gamepad_pads_read(void) {   // front_ios.m: the quit prompt closed, the game reads every controller as it is now (a button held through it counts again)
+     if (g_merge) { for (GCController *c in GCController.controllers) if (c.extendedGamepad) read_pad(c.extendedGamepad); }
+     else for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p].extendedGamepad) read_pad(g_held[p].extendedGamepad);
+diff --git a/dm/ios/Sources/DmPadGeometry.h b/dm/ios/Sources/DmPadGeometry.h
+index d2efd77..27e4cc8 100644
+--- a/dm/ios/Sources/DmPadGeometry.h
++++ b/dm/ios/Sources/DmPadGeometry.h
+@@ -9,6 +9,7 @@
+ #pragma once
+ #import "DmLayout.h"
+ #include <math.h>
++#include <stdio.h>
+ #include <string.h>
+ 
+ NS_ASSUME_NONNULL_BEGIN
+@@ -277,6 +278,42 @@ static inline int dm_pad_layout_count(const DmPadLayout *l) {   // the moved con
+     return n;
+ }
+ 
++// The value for DM_TOUCH_LAYOUT as dm_pad_layout_parse reads it (the shell writes the same form, TouchLayout.encoded): "" when no control is moved,
++// otherwise "1", then ";", the layout's name and "/control:dx,dy" for each moved control, layouts and controls in their enum order. The in-game
++// layout editor (DmGamepad.m, "Edit control layout") saves its arrangement with it. Returns the length, or -1 when out (cap bytes, at least
++// DM_PAD_LAYOUT_MAX + 1 always holds it) is too small; out then holds "".
++static inline int dm_pad_layout_encode(const DmPadLayout *l, char *out, size_t cap) {
++    size_t n = 0;
++    if (cap) out[0] = 0;
++    for (int s = 0; s < DM_PAD_SET_N; s++) {
++        BOOL any = NO;
++        for (int c = 0; c < DM_PAD_C_N; c++) if (l->dx[s][c] || l->dy[s][c]) any = YES;
++        if (!any) continue;
++        for (int pass = 0; pass < 1 + DM_PAD_C_N; pass++) {
++            int w = 0;
++            if (pass == 0) w = snprintf(out + n, cap - n, "%s;%s", n ? "" : "1", dm_pad_set_names[s]);
++            else if (l->dx[s][pass - 1] || l->dy[s][pass - 1]) w = snprintf(out + n, cap - n, "/%s:%d,%d", dm_pad_control_names[pass - 1], l->dx[s][pass - 1], l->dy[s][pass - 1]);
++            else continue;
++            if (w < 0 || (size_t)w >= cap - n) { if (cap) out[0] = 0; return -1; }
++            n += (size_t)w;
++        }
++    }
++    return (int)n;
++}
++
++// The point dm_pad_move shifts for control c: where a drag of the control is measured from (the layout editor).
++static inline CGPoint dm_pad_control_ref(const DmPadGeo *g, int c) {
++    switch (c) {
++    case DM_PAD_C_FACE: return g->face;
++    case DM_PAD_C_A: case DM_PAD_C_B: case DM_PAD_C_X: case DM_PAD_C_Y: return g->faceKey[c - DM_PAD_C_A];
++    case DM_PAD_C_STICK: return g->stick;
++    case DM_PAD_C_DPAD: return g->dpad;
++    case DM_PAD_C_L3: case DM_PAD_C_R3: return g->click[c - DM_PAD_C_L3];
++    case DM_PAD_C_MINUS: case DM_PAD_C_PLUS: return g->pill[c - DM_PAD_C_MINUS].origin;
++    default: return g->drop[c - DM_PAD_C_ZL];
++    }
++}
++
+ // The drawn shapes (dm_pad_shapes ids) of a control.
+ static inline BOOL dm_pad_is_shape_of(int id, int c) {
+     switch (c) {
+diff --git a/dm/ios/Sources/GameMenu.swift b/dm/ios/Sources/GameMenu.swift
+index 9ee0582..9dd8f60 100644
+--- a/dm/ios/Sources/GameMenu.swift
++++ b/dm/ios/Sources/GameMenu.swift
+@@ -1,4 +1,4 @@
+-// The in-game menu, opened by the gamepad's menu button at the top centre (DmGamepad.m): the controller layout, then the settings-screen settings the running game takes at once
++// The in-game menu, opened by the gamepad's menu button at the top centre (DmGamepad.m): the controller layout and its editor, then the settings-screen settings the running game takes at once
+ // (front_ios.m dm_setting_live), grouped as on the settings screen but without its headings, one row each, so the menu stays short over the game (its text size is fixed: front_ios.m
+ // startGame). A pick is saved as Play saves it (LauncherModel.choose), so the settings screen shows it at the next start; a setting an env file fixes is shown, not changed. Settings
+ // that need the next start (language, pipelines, the frame rate and so on), and the sliders, stay on the settings screen, which the menu's title points to.
+@@ -10,11 +10,12 @@ var gameMenuModel: LauncherModel?   // the settings screen's model (Launcher.swi
+ // launcher as DM_HOME_QUIT_TEXT is for the quit prompt: the shell sets it at launch, and a game's own app gets it in its bundled dm/env.txt (the build's
+ // --env-file), where the lines are joined by a backslash and n. A line that is missing or empty stays English.
+ enum GameMenuText: Int, CaseIterable {
+-    case moreSettings, controllerLayout
++    case moreSettings, controllerLayout, editLayout
+     var english: String {
+         switch self {
+         case .moreSettings: return "More settings on the start screen"
+         case .controllerLayout: return "Controller layout"
++        case .editLayout: return "Edit control layout"
+         }
+     }
+     static func line(_ t: GameMenuText, in text: String?) -> String {
+@@ -38,17 +39,25 @@ private func gameMenuItems() -> [UIMenuElement] {
+         UIAction(title: names[l], state: dm_pad_layout() == l ? .on : .off) { _ in dm_pad_layout_set(Int32(l)) }
+     }
+     let layout = UIMenu(title: GameMenuText.controllerLayout.text, options: .singleSelection, children: layouts)   // a choice's value shows in its submenu: a subtitle would make each row two lines
++    // The layout editor (DmGamepad.m): move each control, one size for all, one opacity. It works in a game's own app as in the shell, so it is here and not on the settings screen.
++    // The menu closes first; the editor opens on the next turn of the main loop.
++    var layoutRows: [UIMenuElement] = [layout]
++    if dm_pad_edit_offered() {
++        layoutRows.append(UIAction(title: GameMenuText.editLayout.text, image: UIImage(systemName: "slider.horizontal.3")) { _ in
++            DispatchQueue.main.async { dm_pad_edit_begin() }
++        })
++    }
+     var items: [UIMenuElement] = []
+     var placed = false
+     if let m = gameMenuModel {
+         for section in m.sections {
+-            var rows: [UIMenuElement] = section == "Controls" ? [layout] : []
++            var rows: [UIMenuElement] = section == "Controls" ? layoutRows : []
+             if section == "Controls" { placed = true }
+             for s in m.rows(in: section) where (s.kind == "choice" || s.kind == "toggle") && dm_setting_live(s.env, nil) { rows.append(gameMenuRow(m, s)) }
+             if !rows.isEmpty { items.append(UIMenu(options: .displayInline, children: rows)) }
+         }
+     }
+-    if !placed { items.insert(UIMenu(options: .displayInline, children: [layout]), at: 0) }
++    if !placed { items.insert(UIMenu(options: .displayInline, children: layoutRows), at: 0) }
+     items.append(Unmanaged<UIMenu>.fromOpaque(dm_quit_menu()).takeRetainedValue())   // Quit <game>, last and on its own: it opens the quit prompt (front_ios.m)
+     return items
+ }
+diff --git a/dm/ios/tests/pad_geometry/pad_geometry_check.m b/dm/ios/tests/pad_geometry/pad_geometry_check.m
+index b78567b..ab1668f 100644
+--- a/dm/ios/tests/pad_geometry/pad_geometry_check.m
++++ b/dm/ios/tests/pad_geometry/pad_geometry_check.m
+@@ -148,6 +148,74 @@ static void check_geo(const Screen *s, BOOL full, const DmPadGeo *g, const char
+ static uint32_t g_rng = 2026;
+ static uint32_t rnd(void) { g_rng ^= g_rng << 13; g_rng ^= g_rng >> 17; g_rng ^= g_rng << 5; return g_rng; }
+ 
++// ---- The in-game layout editor (DmGamepad.m, "Edit control layout") ----
++// It saves its arrangement with dm_pad_layout_encode (read back by dm_pad_layout_parse, the shell's TouchLayout.encoded writes the same form) and measures a drag from
++// dm_pad_control_ref, the point dm_pad_move shifts.
++static void check_editor(const Screen *screens, int nscreens) {
++    DmPadLayout l, back; char text[DM_PAD_LAYOUT_MAX + 1];
++    memset(&l, 0, sizeof l);
++    if (dm_pad_layout_encode(&l, text, sizeof text) != 0 || text[0]) FAIL("editor: no moved control does not encode as an empty value");
++    for (int round = 0; round < 300; round++) {
++        memset(&l, 0, sizeof l);
++        int moves = 1 + (int)(rnd() % 20);
++        for (int k = 0; k < moves; k++) {
++            int s = (int)(rnd() % DM_PAD_SET_N), c = (int)(rnd() % DM_PAD_C_N);
++            l.dx[s][c] = (signed char)((int)(rnd() % (2 * DM_PAD_STEP_MAX + 1)) - DM_PAD_STEP_MAX); l.dy[s][c] = (signed char)((int)(rnd() % (2 * DM_PAD_STEP_MAX + 1)) - DM_PAD_STEP_MAX);
++        }
++        int n = dm_pad_layout_encode(&l, text, sizeof text);
++        if (n < 0 || (size_t)n != strlen(text)) { FAIL("editor: round %d: encode returned %d for a %zu character value", round, n, strlen(text)); continue; }
++        if (n && !dm_pad_layout_parse(text, &back)) FAIL("editor: round %d: the engine's own reader refuses '%s'", round, text);
++        else if (n && memcmp(&l, &back, sizeof l)) FAIL("editor: round %d: '%s' does not read back as written", round, text);
++        else if (!n && dm_pad_layout_count(&l)) FAIL("editor: round %d: moved controls encode as an empty value", round);
++    }
++    memset(&l, 0, sizeof l);   // the longest value there is: every control of every layout moved by the largest steps
++    for (int s = 0; s < DM_PAD_SET_N; s++) for (int c = 0; c < DM_PAD_C_N; c++) { l.dx[s][c] = -DM_PAD_STEP_MAX; l.dy[s][c] = -DM_PAD_STEP_MAX; }
++    int longest = dm_pad_layout_encode(&l, text, sizeof text);
++    if (longest < 0 || longest > DM_PAD_LAYOUT_MAX || !dm_pad_layout_parse(text, &back) || memcmp(&l, &back, sizeof l)) FAIL("editor: the longest arrangement (%d characters) does not fit the engine's limit of %d", longest, DM_PAD_LAYOUT_MAX);
++    char tiny[8];
++    if (dm_pad_layout_encode(&l, tiny, sizeof tiny) != -1 || tiny[0]) FAIL("editor: a buffer that is too small is not reported");
++    // The same text as the shell's editor writes (TouchLayoutTests.swift has the example).
++    memset(&l, 0, sizeof l);
++    l.dx[DM_PAD_SET_2D][DM_PAD_C_FACE] = 0; l.dy[DM_PAD_SET_2D][DM_PAD_C_FACE] = -2; l.dx[DM_PAD_SET_2D][DM_PAD_C_STICK] = 1; l.dy[DM_PAD_SET_2D][DM_PAD_C_STICK] = -1;
++    l.dx[DM_PAD_SET_3D][DM_PAD_C_A] = -1;
++    dm_pad_layout_encode(&l, text, sizeof text);
++    if (strcmp(text, "1;2d/face:0,-2/stick:1,-1;3d/a:-1,0")) FAIL("editor: '%s' is not the shell's form", text);
++
++    for (int i = 0; i < nscreens; i++)
++        for (int full = 0; full < 2; full++) {
++            DmPadGeo g = geo(&screens[i], full, (DmPadOptions){1, 0, NULL});
++            DmPadLayout none; memset(&none, 0, sizeof none);
++            for (int c = 0; c < DM_PAD_C_N; c++) {
++                if (!dm_pad_control_drawn(c, full)) continue;
++                DmPadGeo t = g; CGPoint before = dm_pad_control_ref(&t, c);
++                dm_pad_move(&t, c, 7, -5);
++                CGPoint after = dm_pad_control_ref(&t, c);
++                if (!NEAR(after.x - before.x, 7) || !NEAR(after.y - before.y, -5)) FAIL("%s %s: dm_pad_control_ref of %s does not follow dm_pad_move", screens[i].name, full ? "3D" : "2D", dm_pad_control_names[c]);
++            }
++            // A drag as the editor makes it: the offset wanted from the finger, measured from where the control sits with no move of its own. A move that is not dropped puts the
++            // control where wanted unless the area's edge stopped it (never further than asked), and the zero offset is never dropped.
++            for (int round = 0; round < 40; round++) {
++                int c = (int)(rnd() % DM_PAD_C_N);
++                if (!dm_pad_control_drawn(c, full)) continue;
++                int set = (screens[i].partiallyOpen ? DM_PAD_SET_2D_SPLIT : DM_PAD_SET_2D) + (full ? 1 : 0);
++                DmLayout lay = dm_layout(screens[i].bounds, screens[i].insets, screens[i].partiallyOpen, screens[i].division, DM_PICTURE_16_9);
++                set = (lay.separated ? DM_PAD_SET_2D_SPLIT : DM_PAD_SET_2D) + (full ? 1 : 0);
++                DmPadLayout want = none; want.dx[set][c] = (signed char)((int)(rnd() % 21) - 10); want.dy[set][c] = (signed char)((int)(rnd() % 21) - 10);
++                DmPadGeo base = dm_pad_geo(screens[i].bounds, screens[i].insets, lay, full, (DmPadOptions){1, 0, &none});
++                DmPadGeo moved = dm_pad_geo(screens[i].bounds, screens[i].insets, lay, full, (DmPadOptions){1, 0, &want});
++                if (!want.dx[set][c] && !want.dy[set][c]) { if (moved.dropped) FAIL("%s: a control with no move of its own was dropped", screens[i].name); continue; }
++                if (moved.dropped & (1u << c)) continue;
++                CGFloat step = base.faceR / 2; CGPoint a = dm_pad_control_ref(&base, c), b = dm_pad_control_ref(&moved, c);
++                if (!(moved.moved & (1u << c))) FAIL("%s %s: %s not dropped but not moved either", screens[i].name, full ? "3D" : "2D", dm_pad_control_names[c]);
++                CGFloat ex = a.x + want.dx[set][c] * step, ey = a.y + want.dy[set][c] * step;
++                BOOL atWant = NEAR(b.x, ex) && NEAR(b.y, ey);
++                if (!atWant && hypot(b.x - a.x, b.y - a.y) > hypot(ex - a.x, ey - a.y) + 0.5) FAIL("%s %s: %s went further than it was put (%.1f points, %.1f asked)", screens[i].name, full ? "3D" : "2D", dm_pad_control_names[c], hypot(b.x - a.x, b.y - a.y), hypot(ex - a.x, ey - a.y));
++                if (!dm_pad_control_fits(&moved, full, c)) FAIL("%s %s: %s moved to a place that does not fit", screens[i].name, full ? "3D" : "2D", dm_pad_control_names[c]);
++                g_arranged++;
++            }
++        }
++}
++
+ static void check_arrangement(const Screen *screens, int nscreens) {
+     // Reset: a layout of zeros, a value that names a control at 0 0, and a value for other layouts are the built-in geometry exactly,
+     // the points the gamepad has always used (pinned above on the Pro Max).
+@@ -355,6 +423,7 @@ int main(void) {
+ 
+     check_layout_values();
+     check_arrangement(screens, nscreens);
++    check_editor(screens, nscreens);
+     check_duo_outer_custom_bounds();
+ 
+     if (!g_fail) printf("ok: %d screens, %d arrangements\n", nscreens, g_arranged);
