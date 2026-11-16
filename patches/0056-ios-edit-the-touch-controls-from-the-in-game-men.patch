@@ -2,32 +2,42 @@ From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Fork contributor <contributor@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 12:26:04 +0000
 Subject: [PATCH] ios: edit the touch controls from the in-game menu (move,
- size, opacity)
+ per-button size up to 400%, opacity, custom macros)
 
-Adds Edit control layout to the in-game menu (GameMenu.swift). It opens a layout editor over the
-game: drag any control to move it (DM_TOUCH_LAYOUT's steps, kept inside its area and clear of the
-others), one size slider for every control, an opacity slider, a switch to move the A B X Y keys
-one by one, Reset, Cancel and Done. Done saves the arrangement, the size and the opacity in
-NSUserDefaults, so a game's own app, which has no launcher to edit them in, keeps them.
-Saved edits are dropped when DM_TOUCH_LAYOUT or DM_TOUCH_SIZE in the environment changes.
+Adds an upgraded Edit control layout editor to the in-game menu (GameMenu.swift). It opens a
+collapsible floating editor card over the game supporting:
+- Global and per-button resizing from 40% to 400% (tap any control or custom macro to resize it
+  individually, tap the percentage to snap back to 100%, or use All Size for every control).
+- Smooth free drag positioning inside the screen/controls bounds with Split ABXY support to
+  resize and position A, B, X and Y individually, plus overlap-aware selection and guaranteed
+  menu gear reachability.
+- Custom multi-button macro buttons (up to 12 per layout set) with a 4x4 Switch button picker
+  (e.g. X+A), Hold / Toggle / Turbo modes, optional custom label with live preview, and
+  per-macro resizing (40% to 400%) and dragging.
+- Opacity control (15% to 100%), per-item Reset, a two-option Reset menu (keep or clear macros),
+  Cancel and Done.
 
-DmPadGeometry.h gains dm_pad_layout_encode and dm_pad_control_ref, tested on the Mac in
-pad_geometry_check.m.
+Done saves layout arrangement, global scale, per-control custom scales/positions, custom macros
+and opacity in NSUserDefaults, so a game's own app keeps them across launches. Saved layout/size
+edits drop when DM_TOUCH_LAYOUT or DM_TOUCH_SIZE in the environment changes, while custom macros
+are preserved.
+
+DmPadGeometry.h gains DmPadCustom, DmPadMacro/DmPadMacros, dm_pad_apply_custom and encode/parse/
+hit-testing helpers, covered across all 14 screens in pad_geometry_check.m.
 
 Upstream-Status: pending
-Reason: Let a game's own app (no launcher) edit the touch controls in game: move, size, opacity
+Reason: Let a game's own app (no launcher) edit the touch controls in game: move, per-button size up to 400%, opacity, and custom multi-button macro buttons
 Issue: none
-
 ---
- dm/ios/Sources/DmGameMenu.h                   |   4 +-
- dm/ios/Sources/DmGamepad.m                    | 285 +++++++++++++++++-
- dm/ios/Sources/DmPadGeometry.h                |  37 +++
- dm/ios/Sources/GameMenu.swift                 |  17 +-
- .../tests/pad_geometry/pad_geometry_check.m   |  69 +++++
- 5 files changed, 402 insertions(+), 10 deletions(-)
+ dm/ios/Sources/DmGameMenu.h                   |    4 +-
+ dm/ios/Sources/DmGamepad.m                    | 1147 ++++++++++++++++-
+ dm/ios/Sources/DmPadGeometry.h                |  512 +++++++-
+ dm/ios/Sources/GameMenu.swift                 |   17 +-
+ .../tests/pad_geometry/pad_geometry_check.m   |  263 ++++
+ 5 files changed, 1890 insertions(+), 53 deletions(-)
 
 diff --git a/dm/ios/Sources/DmGameMenu.h b/dm/ios/Sources/DmGameMenu.h
-index a7e9c69..0185b6b 100644
+index a7e9c69..9c6289d 100644
 --- a/dm/ios/Sources/DmGameMenu.h
 +++ b/dm/ios/Sources/DmGameMenu.h
 @@ -1,4 +1,4 @@
@@ -41,121 +51,250 @@ index a7e9c69..0185b6b 100644
  bool dm_pad_layout_offered(int layout);   // Tap only in handheld mode
  void dm_pad_layout_set(int layout);   // releases every touch first, and is saved for the next start
 +bool dm_pad_edit_offered(void);   // the layout editor needs controls on screen: not in the Tap layout
-+void dm_pad_edit_begin(void);   // DmGamepad.m: opens the in-game layout editor (move, size, opacity), saved when Done is tapped
++void dm_pad_edit_begin(void);   // DmGamepad.m: opens the in-game layout editor (move, per-button size up to 400%, opacity, custom macro buttons), saved when Done is tapped
  void dm_gamepad_touch_feedback(bool on);   // DM_TOUCH_HAPTICS
  bool dm_setting_live(const char *env, const char *value);
  void *dm_quit_menu(void);   // front_ios.m: the menu's last item, Quit <game>, which opens the quit prompt (a retained UIMenu, shown inline)   // front_ios.m: value NULL asks whether the running game takes env at once; otherwise applies it
 diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
-index 9860743..ee6ebb4 100644
+index 9860743..a9491c5 100644
 --- a/dm/ios/Sources/DmGamepad.m
 +++ b/dm/ios/Sources/DmGamepad.m
-@@ -127,6 +127,10 @@ static const CGFloat                               // (the grab radii of the sti
+@@ -40,7 +40,7 @@
+ #import "DmGameMenu.h"
+ 
+ enum { B_A = 0, B_B, B_X, B_Y, B_LS, B_RS, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS, B_LEFT, B_UP, B_RIGHT, B_DOWN, B_N };
+-enum { C_NONE = 0, C_STICK, C_DPAD, C_FACE, C_BTN, C_GAME };   // which control a touch holds; C_GAME: none, the touch goes to the game's touch screen (finger slot << 8)
++enum { C_NONE = 0, C_STICK, C_DPAD, C_FACE, C_BTN, C_GAME, C_MACRO };   // which control a touch holds; C_GAME: game touch screen; C_MACRO: custom macro button (slot << 8)
+ 
+ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+ static uint64_t g_touch_btn, g_shake_btn;
+@@ -127,6 +127,12 @@ static const CGFloat                               // (the grab radii of the sti
      K_RSWIPE = 1.0 / 3,                             // right stick area: this fraction of the screen width from the right edge (not in u)
      K_MENU_IDLE = 3.0;                              // seconds a connected controller leaves the menu gear visible before fading it out
  static const int k_btns[] = {B_ZL, B_L, B_ZR, B_R, B_MINUS, B_PLUS, B_LS, B_RS};   // keys locked at touch-down (L3 / R3 only in the 3D layout)
-+// The layout editor's saves (NSUserDefaults): the arrangement as DM_TOUCH_LAYOUT's text, the size as a factor of the built-in one, the opacity of the controls (1 = as built), and the
-+// DM_TOUCH_LAYOUT and DM_TOUCH_SIZE the environment held when they were saved: when the shell's own settings change those, the saved edits are dropped and the shell's win.
-+static NSString *const k_edit_layout_key = @"DmPadEditLayout", *const k_edit_scale_key = @"DmPadEditScale", *const k_edit_opacity_key = @"DmPadEditOpacity", *const k_edit_stamp_key = @"DmPadEditStamp";
-+static const CGFloat k_edit_scale_min = 0.6, k_edit_scale_max = 1.4, k_edit_opacity_min = 0.2;
++// The layout editor's saves (NSUserDefaults): the arrangement as DM_TOUCH_LAYOUT's text, the global size (40%..400%), the per-control custom scales & fine positions,
++// the custom macro buttons, the opacity of the controls (1 = as built), and the DM_TOUCH_LAYOUT / DM_TOUCH_SIZE environment stamp: when the shell's own settings
++// change those, the saved layout/size edits are dropped and the shell's win (custom macro buttons are preserved).
++static NSString *const k_edit_layout_key = @"DmPadEditLayout", *const k_edit_scale_key = @"DmPadEditScale", *const k_edit_opacity_key = @"DmPadEditOpacity",
++    *const k_edit_stamp_key = @"DmPadEditStamp", *const k_edit_custom_key = @"DmPadEditCustom", *const k_edit_macros_key = @"DmPadEditMacros";
++static const CGFloat k_edit_scale_min = DM_PAD_SCALE_MIN, k_edit_scale_max = DM_PAD_SCALE_MAX, k_edit_opacity_min = 0.15;
  static NSString *const k_layout_key = @"DmPadLayout";   // NSUserDefaults: 0 = 2D, 1 = 3D, 2 = Tap (DM_GAME_PAD_LAYOUT's numbers)
  int dm_opmode(void);   // hle_oe.c: 0 = handheld
  void front_ios_quit_poll(void);          // front_ios.m: a controller's buttons changed (the Home hold, A and B in the quit prompt)
-@@ -141,6 +145,7 @@ void front_ios_quit_controllers(void);   // front_ios.m: the controllers changed
+@@ -141,6 +147,8 @@ void front_ios_quit_controllers(void);   // front_ios.m: the controllers changed
  - (BOOL)reduceMotionEnabled;
  - (void)wakeMenu;
  - (void)setMenuOpen:(BOOL)open;
 +- (void)editPlaceCard;
++- (void)editPlaceMacroCard:(BOOL)lifted;
  @end
  // The menu button: a UIButton whose menu is the in-game menu (UIKit draws it and takes the touches while it is open). Its hit circle is larger than the drawn one, and a key nearer
  // to the touch wins (− / + sit beside it), so it asks the pad
-@@ -156,6 +161,108 @@ void front_ios_quit_controllers(void);   // front_ios.m: the controllers changed
+@@ -156,17 +164,473 @@ void front_ios_quit_controllers(void);   // front_ios.m: the controllers changed
      [super contextMenuInteraction:i willEndForConfiguration:c animator:a]; [(DmGamepad *)self.superview setMenuOpen:NO];
  }
  @end
 +
-+// The layout editor's card (DmGamepad.m, "Edit control layout" in the in-game menu): a size slider, an opacity slider, a switch that lets the keys of the A B X Y
-+// diamond move one by one, and Reset, Cancel and Done. The title is a grip: dragging it moves the card out of the way of a control. The words are English.
++// The layout editor's card (DmGamepad.m, "Edit control layout" in the in-game menu): supports global and per-button resizing up to 400%,
++// free drag positioning, opacity, Split ABXY for individual A/B/X/Y editing, collapsible compact bar, and custom macro buttons (e.g. X+A).
 +@interface DmPadEditCard : UIView
 +@property (nonatomic, copy) void (^onSize)(CGFloat);
 +@property (nonatomic, copy) void (^onOpacity)(CGFloat);
 +@property (nonatomic, copy) void (^onApart)(BOOL);
-+@property (nonatomic, copy) void (^onReset)(void);
++@property (nonatomic, copy) void (^onSelectAll)(void);
++@property (nonatomic, copy) void (^onResetItem)(void);
++@property (nonatomic, copy) void (^onAddMacro)(void);
++@property (nonatomic, copy) void (^onEditMacro)(void);
++@property (nonatomic, copy) void (^onDeleteMacro)(void);
++@property (nonatomic, copy) void (^onReset)(BOOL includeMacros);
 +@property (nonatomic, copy) void (^onCancel)(void);
 +@property (nonatomic, copy) void (^onDone)(void);
-+- (instancetype)initWithScale:(CGFloat)scale opacity:(CGFloat)opacity min:(CGFloat)smin max:(CGFloat)smax opacityMin:(CGFloat)omin;
-+- (void)setScale:(CGFloat)scale opacity:(CGFloat)opacity;
++- (instancetype)initWithScale:(CGFloat)scale opacity:(CGFloat)opacity apart:(BOOL)apart min:(CGFloat)smin max:(CGFloat)smax opacityMin:(CGFloat)omin;
++- (void)setSelectionName:(NSString *)name isMacro:(BOOL)isMacro hasSelection:(BOOL)hasSelection scale:(CGFloat)scale opacity:(CGFloat)opacity apart:(BOOL)apart macroCount:(int)macroCount;
 +- (CGSize)fittedSizeForWidth:(CGFloat)w;
 +@end
 +@implementation DmPadEditCard {
-+    UISlider *_size, *_opacity; UILabel *_sizeValue, *_opacityValue; UISwitch *_apart;
++    UISlider *_size, *_opacity;
++    UILabel *_badge, *_subtitle, *_sizeName, *_sizeValue, *_opacityValue, *_contextHint;
++    UISwitch *_apart;
++    UIButton *_allBtn, *_collapseBtn, *_resetItemBtn, *_editMacroBtn, *_deleteMacroBtn, *_addMacroBtn, *_doneCompactBtn;
++    UIStackView *_bodyStack;
++    BOOL _collapsed, _hasSelection;
 +}
 +static UILabel *edit_label(NSString *text, CGFloat size, UIFontWeight weight, CGFloat alpha) {
 +    UILabel *l = [UILabel new]; l.text = text; l.font = [UIFont systemFontOfSize:size weight:weight]; l.textColor = [UIColor colorWithWhite:1 alpha:alpha]; l.numberOfLines = 0;
 +    return l;
 +}
-+- (UIStackView *)rowNamed:(NSString *)name slider:(UISlider *)slider value:(UILabel *)value {
-+    UILabel *n = edit_label(name, 13, UIFontWeightMedium, 0.85);
-+    [n.widthAnchor constraintEqualToConstant:62].active = YES;
-+    value.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightRegular]; value.textAlignment = NSTextAlignmentRight;
-+    [value.widthAnchor constraintEqualToConstant:44].active = YES;
-+    UIStackView *r = [[UIStackView alloc] initWithArrangedSubviews:@[n, slider, value]]; r.axis = UILayoutConstraintAxisHorizontal; r.spacing = 8; r.alignment = UIStackViewAlignmentCenter;
++- (UIStackView *)rowNamed:(UILabel *)nameLabel slider:(UISlider *)slider value:(UILabel *)value {
++    [nameLabel.widthAnchor constraintEqualToConstant:58].active = YES;
++    value.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightMedium]; value.textAlignment = NSTextAlignmentRight;
++    [value.widthAnchor constraintEqualToConstant:48].active = YES;
++    UIStackView *r = [[UIStackView alloc] initWithArrangedSubviews:@[nameLabel, slider, value]];
++    r.axis = UILayoutConstraintAxisHorizontal; r.spacing = 8; r.alignment = UIStackViewAlignmentCenter;
 +    return r;
 +}
-+- (UIButton *)button:(NSString *)title style:(int)style action:(void (^)(void))block {
++- (UIButton *)button:(NSString *)title style:(int)style tint:(UIColor *)tint action:(void (^)(void))block {
 +    UIButtonConfiguration *c = style == 2 ? [UIButtonConfiguration filledButtonConfiguration] : style == 1 ? [UIButtonConfiguration tintedButtonConfiguration] : [UIButtonConfiguration plainButtonConfiguration];
 +    c.title = title; c.buttonSize = UIButtonConfigurationSizeSmall; c.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-+    if (style == 0) c.baseForegroundColor = [UIColor colorWithRed:1 green:0.45 blue:0.4 alpha:1];
++    if (tint) {
++        c.baseForegroundColor = tint;
++        if (style == 1 || style == 2) c.baseBackgroundColor = tint;
++    } else if (style == 0) {
++        c.baseForegroundColor = [UIColor colorWithRed:1 green:0.45 blue:0.4 alpha:1];
++    }
 +    return [UIButton buttonWithConfiguration:c primaryAction:[UIAction actionWithHandler:^(UIAction *a) { (void)a; if (block) block(); }]];
 +}
-+- (instancetype)initWithScale:(CGFloat)scale opacity:(CGFloat)opacity min:(CGFloat)smin max:(CGFloat)smax opacityMin:(CGFloat)omin {
++- (instancetype)initWithScale:(CGFloat)scale opacity:(CGFloat)opacity apart:(BOOL)apart min:(CGFloat)smin max:(CGFloat)smax opacityMin:(CGFloat)omin {
 +    if ((self = [super initWithFrame:CGRectZero])) {
 +        self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
-+        self.backgroundColor = [UIColor colorWithRed:0.10 green:0.10 blue:0.11 alpha:0.96]; self.layer.cornerRadius = 20;
++        self.backgroundColor = [UIColor colorWithRed:0.09 green:0.09 blue:0.11 alpha:0.96]; self.layer.cornerRadius = 20;
 +        self.layer.borderWidth = 1; self.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
-+        self.layer.shadowColor = UIColor.blackColor.CGColor; self.layer.shadowOpacity = 0.4; self.layer.shadowRadius = 14; self.layer.shadowOffset = CGSizeMake(0, 4);
++        self.layer.shadowColor = UIColor.blackColor.CGColor; self.layer.shadowOpacity = 0.45; self.layer.shadowRadius = 14; self.layer.shadowOffset = CGSizeMake(0, 4);
 +        __weak DmPadEditCard *weak = self;
++        UIColor *cyan = [UIColor colorWithRed:0.35 green:0.82 blue:1.0 alpha:1];
++        UIColor *danger = [UIColor colorWithRed:1.0 green:0.45 blue:0.4 alpha:1];
 +
-+        UIStackView *head = [[UIStackView alloc] initWithArrangedSubviews:@[edit_label(@"Edit control layout", 15, UIFontWeightBold, 1), edit_label(@"Drag a control to move it. Drag here to move this card.", 12, UIFontWeightRegular, 0.6)]];
-+        head.axis = UILayoutConstraintAxisVertical; head.spacing = 2;
++        UILabel *title = edit_label(@"Edit Layout", 15, UIFontWeightBold, 1);
++        [title setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
++        _badge = edit_label(@"All Controls", 11, UIFontWeightSemibold, 0.95);
++        _badge.textColor = cyan; _badge.textAlignment = NSTextAlignmentCenter; _badge.numberOfLines = 1;
++        _badge.backgroundColor = [UIColor colorWithRed:0.35 green:0.82 blue:1.0 alpha:0.16];
++        _badge.layer.cornerRadius = 9; _badge.layer.masksToBounds = YES;
++        [_badge setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
++        UIView *badgeWrap = [UIView new]; _badge.translatesAutoresizingMaskIntoConstraints = NO; [badgeWrap addSubview:_badge];
++        [NSLayoutConstraint activateConstraints:@[
++            [_badge.topAnchor constraintEqualToAnchor:badgeWrap.topAnchor], [_badge.bottomAnchor constraintEqualToAnchor:badgeWrap.bottomAnchor],
++            [_badge.leadingAnchor constraintEqualToAnchor:badgeWrap.leadingAnchor], [_badge.trailingAnchor constraintEqualToAnchor:badgeWrap.trailingAnchor],
++            [_badge.heightAnchor constraintEqualToConstant:20], [_badge.widthAnchor constraintGreaterThanOrEqualToConstant:72],
++        ]];
++
++        UIView *topSpacer = [UIView new]; [topSpacer setContentHuggingPriority:UILayoutPriorityDefaultLow - 1 forAxis:UILayoutConstraintAxisHorizontal];
++        _allBtn = [self button:@"All" style:1 tint:cyan action:^{ if (weak.onSelectAll) weak.onSelectAll(); }];
++        _allBtn.hidden = YES;
++        _doneCompactBtn = [self button:@"Done" style:2 tint:nil action:^{ if (weak.onDone) weak.onDone(); }];
++        _doneCompactBtn.hidden = YES;
++        _collapseBtn = [self button:@"▴" style:1 tint:[UIColor colorWithWhite:0.9 alpha:1] action:^{ [weak toggleCollapse]; }];
++
++        UIStackView *titleRow = [[UIStackView alloc] initWithArrangedSubviews:@[title, badgeWrap, topSpacer, _allBtn, _doneCompactBtn, _collapseBtn]];
++        titleRow.axis = UILayoutConstraintAxisHorizontal; titleRow.spacing = 6; titleRow.alignment = UIStackViewAlignmentCenter;
++        _subtitle = edit_label(@"Tap any control to resize (up to 400%) · Drag to move · Drag here to move card", 11, UIFontWeightRegular, 0.58);
++        UIStackView *head = [[UIStackView alloc] initWithArrangedSubviews:@[titleRow, _subtitle]];
++        head.axis = UILayoutConstraintAxisVertical; head.spacing = 3;
 +        UIView *grip = [UIView new]; head.translatesAutoresizingMaskIntoConstraints = NO; [grip addSubview:head];
-+        [NSLayoutConstraint activateConstraints:@[[head.topAnchor constraintEqualToAnchor:grip.topAnchor], [head.bottomAnchor constraintEqualToAnchor:grip.bottomAnchor],
-+                                                  [head.leadingAnchor constraintEqualToAnchor:grip.leadingAnchor], [head.trailingAnchor constraintEqualToAnchor:grip.trailingAnchor]]];
++        [NSLayoutConstraint activateConstraints:@[
++            [head.topAnchor constraintEqualToAnchor:grip.topAnchor], [head.bottomAnchor constraintEqualToAnchor:grip.bottomAnchor],
++            [head.leadingAnchor constraintEqualToAnchor:grip.leadingAnchor], [head.trailingAnchor constraintEqualToAnchor:grip.trailingAnchor],
++        ]];
 +        [grip addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
 +
++        _sizeName = edit_label(@"All Size", 13, UIFontWeightMedium, 0.88);
 +        _size = [UISlider new]; _size.minimumValue = smin; _size.maximumValue = smax; _size.value = scale;
-+        _sizeValue = edit_label(@"", 13, UIFontWeightRegular, 0.85);
++        _size.minimumTrackTintColor = cyan;
++        _sizeValue = edit_label(@"", 13, UIFontWeightMedium, 0.92);
++        _sizeValue.userInteractionEnabled = YES;
++        [_sizeValue addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(sizeValueTapped)]];
 +        [_size addTarget:self action:@selector(sizeChanged) forControlEvents:UIControlEventValueChanged];
++
 +        _opacity = [UISlider new]; _opacity.minimumValue = omin; _opacity.maximumValue = 1; _opacity.value = opacity;
-+        _opacityValue = edit_label(@"", 13, UIFontWeightRegular, 0.85);
++        _opacityValue = edit_label(@"", 13, UIFontWeightMedium, 0.85);
 +        [_opacity addTarget:self action:@selector(opacityChanged) forControlEvents:UIControlEventValueChanged];
 +
-+        UILabel *apartName = edit_label(@"Move A B X Y keys one by one", 13, UIFontWeightMedium, 0.85);
-+        _apart = [UISwitch new]; [_apart addTarget:self action:@selector(apartChanged) forControlEvents:UIControlEventValueChanged];
++        UILabel *apartName = edit_label(@"Split ABXY", 12, UIFontWeightMedium, 0.85);
++        [apartName setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
++        _apart = [UISwitch new]; _apart.on = apart; _apart.transform = CGAffineTransformMakeScale(0.82, 0.82);
++        [_apart addTarget:self action:@selector(apartChanged) forControlEvents:UIControlEventValueChanged];
 +        [_apart setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
-+        UIStackView *apartRow = [[UIStackView alloc] initWithArrangedSubviews:@[apartName, _apart]]; apartRow.axis = UILayoutConstraintAxisHorizontal; apartRow.spacing = 8; apartRow.alignment = UIStackViewAlignmentCenter;
 +
-+        UIView *spacer = [UIView new]; [spacer setContentHuggingPriority:UILayoutPriorityDefaultLow - 1 forAxis:UILayoutConstraintAxisHorizontal];   // the gap takes the slack, the buttons stay their size
++        UIView *midSpacer = [UIView new]; [midSpacer setContentHuggingPriority:UILayoutPriorityDefaultLow - 1 forAxis:UILayoutConstraintAxisHorizontal];
++        _contextHint = edit_label(@"Tap a button to edit", 11, UIFontWeightRegular, 0.5);
++        _contextHint.textAlignment = NSTextAlignmentRight;
++        _resetItemBtn = [self button:@"Reset Item" style:1 tint:danger action:^{ if (weak.onResetItem) weak.onResetItem(); }];
++        _resetItemBtn.hidden = YES;
++        _editMacroBtn = [self button:@"Edit" style:1 tint:cyan action:^{ if (weak.onEditMacro) weak.onEditMacro(); }];
++        _editMacroBtn.hidden = YES;
++        _deleteMacroBtn = [self button:@"Delete" style:0 tint:danger action:^{ if (weak.onDeleteMacro) weak.onDeleteMacro(); }];
++        _deleteMacroBtn.hidden = YES;
++
++        UIStackView *contextRow = [[UIStackView alloc] initWithArrangedSubviews:@[apartName, _apart, midSpacer, _contextHint, _resetItemBtn, _editMacroBtn, _deleteMacroBtn]];
++        contextRow.axis = UILayoutConstraintAxisHorizontal; contextRow.spacing = 6; contextRow.alignment = UIStackViewAlignmentCenter;
++
++        _addMacroBtn = [self button:@"+ Macro" style:1 tint:cyan action:^{ if (weak.onAddMacro) weak.onAddMacro(); }];
++        UIButtonConfiguration *rcfg = [UIButtonConfiguration plainButtonConfiguration];
++        rcfg.title = @"Reset"; rcfg.buttonSize = UIButtonConfigurationSizeSmall; rcfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
++        rcfg.baseForegroundColor = danger;
++        UIButton *resetBtn = [UIButton buttonWithConfiguration:rcfg primaryAction:nil];
++        resetBtn.showsMenuAsPrimaryAction = YES;
++        UIAction *resetLayoutAct = [UIAction actionWithTitle:@"Reset Positions & Sizes" image:[UIImage systemImageNamed:@"arrow.counterclockwise"] identifier:nil handler:^(UIAction *a) { (void)a; if (weak.onReset) weak.onReset(NO); }];
++        UIAction *resetAllAct = [UIAction actionWithTitle:@"Reset Everything (incl. Macros)" image:[UIImage systemImageNamed:@"trash"] identifier:nil handler:^(UIAction *a) { (void)a; if (weak.onReset) weak.onReset(YES); }];
++        resetAllAct.attributes = UIMenuElementAttributesDestructive;
++        resetBtn.menu = [UIMenu menuWithTitle:@"" children:@[resetLayoutAct, resetAllAct]];
++
++        UIView *botSpacer = [UIView new]; [botSpacer setContentHuggingPriority:UILayoutPriorityDefaultLow - 1 forAxis:UILayoutConstraintAxisHorizontal];
 +        UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[
-+            [self button:@"Reset" style:0 action:^{ if (weak.onReset) weak.onReset(); }], spacer,
-+            [self button:@"Cancel" style:1 action:^{ if (weak.onCancel) weak.onCancel(); }],
-+            [self button:@"Done" style:2 action:^{ if (weak.onDone) weak.onDone(); }]]];
-+        buttons.axis = UILayoutConstraintAxisHorizontal; buttons.spacing = 8; buttons.alignment = UIStackViewAlignmentCenter;
++            _addMacroBtn, resetBtn, botSpacer,
++            [self button:@"Cancel" style:1 tint:nil action:^{ if (weak.onCancel) weak.onCancel(); }],
++            [self button:@"Done" style:2 tint:nil action:^{ if (weak.onDone) weak.onDone(); }],
++        ]];
++        buttons.axis = UILayoutConstraintAxisHorizontal; buttons.spacing = 6; buttons.alignment = UIStackViewAlignmentCenter;
 +
-+        UIStackView *all = [[UIStackView alloc] initWithArrangedSubviews:@[grip, [self rowNamed:@"Size" slider:_size value:_sizeValue], [self rowNamed:@"Opacity" slider:_opacity value:_opacityValue], apartRow, buttons]];
-+        all.axis = UILayoutConstraintAxisVertical; all.spacing = 10; all.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:all];
-+        [NSLayoutConstraint activateConstraints:@[[all.topAnchor constraintEqualToAnchor:self.topAnchor constant:14], [all.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-12],
-+                                                  [all.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16], [all.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16]]];
++        _bodyStack = [[UIStackView alloc] initWithArrangedSubviews:@[
++            [self rowNamed:_sizeName slider:_size value:_sizeValue],
++            [self rowNamed:edit_label(@"Opacity", 13, UIFontWeightMedium, 0.85) slider:_opacity value:_opacityValue],
++            contextRow,
++            buttons,
++        ]];
++        _bodyStack.axis = UILayoutConstraintAxisVertical; _bodyStack.spacing = 8;
++
++        UIStackView *all = [[UIStackView alloc] initWithArrangedSubviews:@[grip, _bodyStack]];
++        all.axis = UILayoutConstraintAxisVertical; all.spacing = 8; all.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:all];
++        [NSLayoutConstraint activateConstraints:@[
++            [all.topAnchor constraintEqualToAnchor:self.topAnchor constant:12], [all.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-10],
++            [all.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:14], [all.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-14],
++        ]];
 +        [self showValues];
 +    }
 +    return self;
++}
++- (void)toggleCollapse {
++    _collapsed = !_collapsed;
++    _bodyStack.hidden = _collapsed;
++    _subtitle.hidden = _collapsed;
++    _doneCompactBtn.hidden = !_collapsed;
++    _allBtn.hidden = _collapsed || !_hasSelection;
++    UIButtonConfiguration *c = _collapseBtn.configuration;
++    c.title = _collapsed ? @"▾" : @"▴";
++    _collapseBtn.configuration = c;
++    if ([self.superview isKindOfClass:DmGamepad.class]) [(DmGamepad *)self.superview editPlaceCard];
 +}
 +- (void)showValues {
 +    _sizeValue.text = [NSString stringWithFormat:@"%d%%", (int)lround(_size.value * 100)];
 +    _opacityValue.text = [NSString stringWithFormat:@"%d%%", (int)lround(_opacity.value * 100)];
 +}
-+- (void)setScale:(CGFloat)scale opacity:(CGFloat)opacity { _size.value = scale; _opacity.value = opacity; [self showValues]; }
++- (void)setSelectionName:(NSString *)name isMacro:(BOOL)isMacro hasSelection:(BOOL)hasSelection scale:(CGFloat)scale opacity:(CGFloat)opacity apart:(BOOL)apart macroCount:(int)macroCount {
++    _hasSelection = hasSelection;
++    _badge.text = [NSString stringWithFormat:@"  %@  ", name ?: @"All Controls"];
++    _sizeName.text = hasSelection ? @"Size" : @"All Size";
++    _size.value = (float)fmax(_size.minimumValue, fmin(_size.maximumValue, scale));
++    _opacity.value = (float)fmax(_opacity.minimumValue, fmin(_opacity.maximumValue, opacity));
++    if (_apart.isOn != apart) _apart.on = apart;
++    _allBtn.hidden = _collapsed || !hasSelection;
++    _contextHint.hidden = hasSelection;
++    _resetItemBtn.hidden = !hasSelection || isMacro;
++    _editMacroBtn.hidden = !isMacro;
++    _deleteMacroBtn.hidden = !isMacro;
++    BOOL fullMacros = macroCount >= DM_PAD_MACRO_MAX;
++    _addMacroBtn.enabled = !fullMacros;
++    UIButtonConfiguration *ac = _addMacroBtn.configuration;
++    ac.title = fullMacros ? @"Max 12" : @"+ Macro";
++    _addMacroBtn.configuration = ac;
++    [self showValues];
++}
++- (void)sizeValueTapped {
++    _size.value = 1;
++    [self showValues]; if (self.onSize) self.onSize(1);
++}
 +- (void)sizeChanged {
-+    if (fabs(_size.value - 1) < 0.025) _size.value = 1;   // the built-in size catches
++    if (fabs(_size.value - 1) < 0.035) _size.value = 1;   // gentle snap to 100% across the 40%..400% range
 +    [self showValues]; if (self.onSize) self.onSize(_size.value);
 +}
 +- (void)opacityChanged {
@@ -173,43 +312,357 @@ index 9860743..ee6ebb4 100644
 +    CGSize s = [self systemLayoutSizeFittingSize:CGSizeMake(w, UILayoutFittingCompressedSize.height) withHorizontalFittingPriority:UILayoutPriorityRequired verticalFittingPriority:UILayoutPriorityFittingSizeLevel];
 +    return CGSizeMake(w, ceil(s.height));
 +}
++// Swallow stray touches on the card's background so they never leak through to controls underneath.
++- (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { (void)ts; (void)e; }
++- (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { (void)ts; (void)e; }
++- (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { (void)ts; (void)e; }
++- (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { (void)ts; (void)e; }
 +@end
++
++// Custom Macro Button builder card: tap any combination of Switch buttons (e.g. X + A), pick Hold / Toggle / Turbo,
++// optionally type a short label (defaults to "X+A"), and add it directly to the touch layout.
++@interface DmPadMacroCard : UIView
++@property (nonatomic, copy) void (^onSave)(uint64_t mask, int mode, NSString *label);
++@property (nonatomic, copy) void (^onDelete)(void);
++@property (nonatomic, copy) void (^onCancel)(void);
++- (instancetype)initWithMask:(uint64_t)mask mode:(int)mode label:(NSString *)label editing:(BOOL)editing;
++- (CGSize)fittedSizeForWidth:(CGFloat)w maxHeight:(CGFloat)maxH;
++@end
++@implementation DmPadMacroCard {
++    uint64_t _mask;
++    int _order[16]; int _orderLen;
++    UIButton *_gridBtn[16];
++    UISegmentedControl *_modeSeg;
++    UITextField *_labelField;
++    UILabel *_previewBadge;
++    UIButton *_saveBtn;
++    UIScrollView *_scroll;
++    UIStackView *_content;
++}
++static const struct { int bit; const char *title; } k_macro_grid[16] = {
++    {B_A, "A"}, {B_B, "B"}, {B_X, "X"}, {B_Y, "Y"},
++    {B_ZL, "ZL"}, {B_L, "L"}, {B_R, "R"}, {B_ZR, "ZR"},
++    {B_LS, "L3"}, {B_RS, "R3"}, {B_MINUS, "\xE2\x88\x92"}, {B_PLUS, "+"},
++    {B_UP, "\xE2\x86\x91"}, {B_DOWN, "\xE2\x86\x93"}, {B_LEFT, "\xE2\x86\x90"}, {B_RIGHT, "\xE2\x86\x92"},
++};
++static UIColor *macro_mode_accent(int mode) {
++    if (mode == DM_PAD_MACRO_TOGGLE) return [UIColor colorWithRed:1.0 green:0.78 blue:0.32 alpha:1];
++    if (mode == DM_PAD_MACRO_TURBO) return [UIColor colorWithRed:0.38 green:0.92 blue:0.62 alpha:1];
++    return [UIColor colorWithRed:0.35 green:0.82 blue:1.0 alpha:1];
++}
++- (instancetype)initWithMask:(uint64_t)mask mode:(int)mode label:(NSString *)existingLabel editing:(BOOL)editing {
++    if ((self = [super initWithFrame:CGRectZero])) {
++        _mask = mask & 0xFFFFu;
++        self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
++        self.backgroundColor = [UIColor colorWithRed:0.09 green:0.09 blue:0.11 alpha:0.97]; self.layer.cornerRadius = 20;
++        self.layer.borderWidth = 1; self.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.2].CGColor;
++        self.layer.shadowColor = UIColor.blackColor.CGColor; self.layer.shadowOpacity = 0.5; self.layer.shadowRadius = 16; self.layer.shadowOffset = CGSizeMake(0, 6);
++        __weak DmPadMacroCard *weak = self;
++
++        UILabel *title = edit_label(editing ? @"Edit Macro Button" : @"New Macro Button", 15, UIFontWeightBold, 1);
++        _previewBadge = edit_label(@"Pick buttons", 12, UIFontWeightBold, 1);
++        _previewBadge.textAlignment = NSTextAlignmentCenter; _previewBadge.numberOfLines = 1;
++        _previewBadge.layer.cornerRadius = 11; _previewBadge.layer.masksToBounds = YES; _previewBadge.layer.borderWidth = 1;
++        [_previewBadge.heightAnchor constraintEqualToConstant:24].active = YES;
++        [_previewBadge.widthAnchor constraintGreaterThanOrEqualToConstant:76].active = YES;
++        UIView *hSpacer = [UIView new]; [hSpacer setContentHuggingPriority:UILayoutPriorityDefaultLow - 1 forAxis:UILayoutConstraintAxisHorizontal];
++        UIStackView *header = [[UIStackView alloc] initWithArrangedSubviews:@[title, hSpacer, _previewBadge]];
++        header.axis = UILayoutConstraintAxisHorizontal; header.spacing = 8; header.alignment = UIStackViewAlignmentCenter;
++
++        // 4x4 Switch button picker: tap any buttons (e.g. X + A) to combine them into a single button.
++        NSMutableArray<UIView *> *rows = [NSMutableArray arrayWithCapacity:4];
++        for (int r = 0; r < 4; r++) {
++            NSMutableArray<UIView *> *cols = [NSMutableArray arrayWithCapacity:4];
++            for (int c = 0; c < 4; c++) {
++                int idx = r * 4 + c, bit = k_macro_grid[idx].bit;
++                UIButtonConfiguration *cfg = [UIButtonConfiguration tintedButtonConfiguration];
++                cfg.title = @(k_macro_grid[idx].title);
++                cfg.buttonSize = UIButtonConfigurationSizeSmall;
++                cfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
++                UIButton *b = [UIButton buttonWithConfiguration:cfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) {
++                    (void)a; [weak toggleBit:bit];
++                }]];
++                [b.heightAnchor constraintEqualToConstant:30].active = YES;
++                _gridBtn[idx] = b;
++                [cols addObject:b];
++            }
++            UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:cols];
++            row.axis = UILayoutConstraintAxisHorizontal; row.spacing = 6; row.distribution = UIStackViewDistributionFillEqually;
++            [rows addObject:row];
++        }
++        UIStackView *grid = [[UIStackView alloc] initWithArrangedSubviews:rows];
++        grid.axis = UILayoutConstraintAxisVertical; grid.spacing = 5;
++
++        // Mode selector (Hold / Toggle / Turbo) + optional custom label field.
++        _modeSeg = [[UISegmentedControl alloc] initWithItems:@[@"Hold", @"Toggle", @"Turbo"]];
++        _modeSeg.selectedSegmentIndex = (mode >= DM_PAD_MACRO_HOLD && mode <= DM_PAD_MACRO_TURBO) ? mode : DM_PAD_MACRO_HOLD;
++        [_modeSeg addTarget:self action:@selector(refreshState) forControlEvents:UIControlEventValueChanged];
++        [_modeSeg.heightAnchor constraintEqualToConstant:30].active = YES;
++
++        _labelField = [UITextField new];
++        _labelField.placeholder = @"Auto label";
++        _labelField.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
++        _labelField.textColor = UIColor.whiteColor;
++        _labelField.backgroundColor = [UIColor colorWithWhite:1 alpha:0.1];
++        _labelField.layer.cornerRadius = 8; _labelField.layer.borderWidth = 1; _labelField.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
++        _labelField.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 8, 1)]; _labelField.leftViewMode = UITextFieldViewModeAlways;
++        _labelField.rightView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 8, 1)]; _labelField.rightViewMode = UITextFieldViewModeAlways;
++        _labelField.autocorrectionType = UITextAutocorrectionTypeNo; _labelField.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
++        _labelField.returnKeyType = UIReturnKeyDone; _labelField.clearButtonMode = UITextFieldViewModeWhileEditing;
++        [_labelField.heightAnchor constraintEqualToConstant:30].active = YES;
++        [_labelField.widthAnchor constraintEqualToConstant:118].active = YES;
++        [_labelField addTarget:self action:@selector(refreshState) forControlEvents:UIControlEventEditingChanged];
++        [_labelField addTarget:self action:@selector(fieldBegan) forControlEvents:UIControlEventEditingDidBegin];
++        [_labelField addTarget:self action:@selector(fieldEnded) forControlEvents:UIControlEventEditingDidEnd];
++        [_labelField addTarget:self action:@selector(fieldReturn) forControlEvents:UIControlEventEditingDidEndOnExit];
++        if (editing && existingLabel.length) {
++            char def[DM_PAD_MACRO_LABEL_MAX + 1]; dm_pad_macro_default_label(_mask, def, sizeof def);
++            if (![existingLabel isEqualToString:@(def)]) _labelField.text = existingLabel;
++        }
++        UIStackView *modeRow = [[UIStackView alloc] initWithArrangedSubviews:@[_modeSeg, _labelField]];
++        modeRow.axis = UILayoutConstraintAxisHorizontal; modeRow.spacing = 8; modeRow.alignment = UIStackViewAlignmentCenter;
++
++        // Bottom actions: Clear, optional Delete, Cancel, Add / Save.
++        UIButtonConfiguration *clrCfg = [UIButtonConfiguration plainButtonConfiguration];
++        clrCfg.title = @"Clear"; clrCfg.buttonSize = UIButtonConfigurationSizeSmall; clrCfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
++        clrCfg.baseForegroundColor = [UIColor colorWithWhite:0.72 alpha:1];
++        UIButton *clearBtn = [UIButton buttonWithConfiguration:clrCfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) {
++            (void)a; [weak clearBits];
++        }]];
++
++        NSMutableArray<UIView *> *actViews = [NSMutableArray arrayWithObject:clearBtn];
++        if (editing) {
++            UIButtonConfiguration *delCfg = [UIButtonConfiguration plainButtonConfiguration];
++            delCfg.title = @"Delete"; delCfg.buttonSize = UIButtonConfigurationSizeSmall; delCfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
++            delCfg.baseForegroundColor = [UIColor colorWithRed:1 green:0.45 blue:0.4 alpha:1];
++            [actViews addObject:[UIButton buttonWithConfiguration:delCfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) {
++                (void)a; [weak endEditing:YES]; if (weak.onDelete) weak.onDelete();
++            }]]];
++        }
++        UIView *bSpacer = [UIView new]; [bSpacer setContentHuggingPriority:UILayoutPriorityDefaultLow - 1 forAxis:UILayoutConstraintAxisHorizontal];
++        [actViews addObject:bSpacer];
++
++        UIButtonConfiguration *canCfg = [UIButtonConfiguration tintedButtonConfiguration];
++        canCfg.title = @"Cancel"; canCfg.buttonSize = UIButtonConfigurationSizeSmall; canCfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
++        [actViews addObject:[UIButton buttonWithConfiguration:canCfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) {
++            (void)a; [weak endEditing:YES]; if (weak.onCancel) weak.onCancel();
++        }]]];
++
++        UIButtonConfiguration *savCfg = [UIButtonConfiguration filledButtonConfiguration];
++        savCfg.title = editing ? @"Save" : @"Add"; savCfg.buttonSize = UIButtonConfigurationSizeSmall; savCfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
++        _saveBtn = [UIButton buttonWithConfiguration:savCfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) {
++            (void)a; [weak commitSave];
++        }]];
++        [actViews addObject:_saveBtn];
++        UIStackView *actions = [[UIStackView alloc] initWithArrangedSubviews:actViews];
++        actions.axis = UILayoutConstraintAxisHorizontal; actions.spacing = 6; actions.alignment = UIStackViewAlignmentCenter;
++
++        _content = [[UIStackView alloc] initWithArrangedSubviews:@[header, grid, modeRow, actions]];
++        _content.axis = UILayoutConstraintAxisVertical; _content.spacing = 8; _content.translatesAutoresizingMaskIntoConstraints = NO;
++
++        _scroll = [UIScrollView new]; _scroll.translatesAutoresizingMaskIntoConstraints = NO;
++        _scroll.showsVerticalScrollIndicator = YES; _scroll.alwaysBounceVertical = NO;
++        [_scroll addSubview:_content]; [self addSubview:_scroll];
++        [NSLayoutConstraint activateConstraints:@[
++            [_scroll.topAnchor constraintEqualToAnchor:self.topAnchor constant:12], [_scroll.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-12],
++            [_scroll.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:14], [_scroll.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-14],
++            [_content.topAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.topAnchor], [_content.bottomAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.bottomAnchor],
++            [_content.leadingAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.leadingAnchor], [_content.trailingAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.trailingAnchor],
++            [_content.widthAnchor constraintEqualToAnchor:_scroll.frameLayoutGuide.widthAnchor],
++        ]];
++        [self refreshState];
++    }
++    return self;
++}
++- (void)toggleBit:(int)bit {
++    uint64_t flag = 1ull << bit;
++    if (_mask & flag) {
++        _mask &= ~flag;
++        for (int i = 0; i < _orderLen; i++) if (_order[i] == bit) {
++            for (int j = i; j + 1 < _orderLen; j++) _order[j] = _order[j + 1];
++            _orderLen--; break;
++        }
++    } else {
++        _mask |= flag;
++        if (_orderLen < 16) _order[_orderLen++] = bit;
++    }
++    [self refreshState];
++}
++- (void)clearBits { _mask = 0; _orderLen = 0; _labelField.text = @""; [self refreshState]; }
++- (NSString *)computedLabel {
++    NSString *typed = [_labelField.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
++    if (typed.length) return typed;
++    if (!_mask) return @"";
++    if (_orderLen > 0) {
++        NSMutableString *s = [NSMutableString string];
++        for (int i = 0; i < _orderLen; i++) {
++            int b = _order[i];
++            if (!((_mask >> b) & 1ull)) continue;
++            if (s.length) [s appendString:@"+"];
++            [s appendString:@(dm_pad_btn_labels[b])];
++        }
++        if (s.length) return s;
++    }
++    char buf[DM_PAD_MACRO_LABEL_MAX + 1]; dm_pad_macro_default_label(_mask, buf, sizeof buf);
++    return @(buf);
++}
++- (void)refreshState {
++    int mode = (int)_modeSeg.selectedSegmentIndex;
++    UIColor *accent = macro_mode_accent(mode);
++    for (int i = 0; i < 16; i++) {
++        BOOL on = ((_mask >> k_macro_grid[i].bit) & 1ull) != 0;
++        UIButtonConfiguration *c = on ? [UIButtonConfiguration filledButtonConfiguration] : [UIButtonConfiguration tintedButtonConfiguration];
++        c.title = @(k_macro_grid[i].title); c.buttonSize = UIButtonConfigurationSizeSmall; c.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
++        if (on) { c.baseBackgroundColor = accent; c.baseForegroundColor = UIColor.blackColor; }
++        else { c.baseBackgroundColor = [UIColor colorWithWhite:1 alpha:0.14]; c.baseForegroundColor = [UIColor colorWithWhite:0.92 alpha:1]; }
++        _gridBtn[i].configuration = c;
++    }
++    NSString *lbl = [self computedLabel];
++    _previewBadge.text = lbl.length ? [NSString stringWithFormat:@"  %@  ", lbl] : @"  Pick buttons  ";
++    _previewBadge.textColor = lbl.length ? accent : [UIColor colorWithWhite:0.6 alpha:1];
++    _previewBadge.backgroundColor = [accent colorWithAlphaComponent:lbl.length ? 0.18 : 0.06];
++    _previewBadge.layer.borderColor = [accent colorWithAlphaComponent:lbl.length ? 0.6 : 0.18].CGColor;
++    _saveBtn.enabled = _mask != 0;
++}
++- (void)fieldBegan { if ([self.superview isKindOfClass:DmGamepad.class]) [(DmGamepad *)self.superview editPlaceMacroCard:YES]; }
++- (void)fieldEnded { if ([self.superview isKindOfClass:DmGamepad.class]) [(DmGamepad *)self.superview editPlaceMacroCard:NO]; }
++- (void)fieldReturn { [_labelField resignFirstResponder]; }
++- (void)commitSave {
++    if (!_mask) return;
++    [self endEditing:YES];
++    NSString *lbl = [self computedLabel];
++    int mode = (int)_modeSeg.selectedSegmentIndex;
++    if (self.onSave) self.onSave(_mask, mode, lbl);
++}
++- (CGSize)fittedSizeForWidth:(CGFloat)w maxHeight:(CGFloat)maxH {
++    CGSize s = [_content systemLayoutSizeFittingSize:CGSizeMake(w - 28, UILayoutFittingCompressedSize.height) withHorizontalFittingPriority:UILayoutPriorityRequired verticalFittingPriority:UILayoutPriorityFittingSizeLevel];
++    return CGSizeMake(w, fmin(ceil(s.height) + 24, maxH));
++}
++- (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { (void)ts; (void)e; [self endEditing:YES]; }
++- (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { (void)ts; (void)e; }
++- (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { (void)ts; (void)e; }
++- (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { (void)ts; (void)e; }
++@end
++
  static __weak DmGamepad *g_view;
  static void pads_start(void);   // Physical controllers, below
  
-@@ -185,6 +292,13 @@ static void pads_start(void);   // Physical controllers, below
+ @implementation DmGamepad {
+-    NSMapTable<UITouch *, NSNumber *> *_owner;     // touch → control (with the key for C_BTN or the stick for C_STICK, << 8)
++    NSMapTable<UITouch *, NSNumber *> *_owner;     // touch → control (with the key for C_BTN, the stick for C_STICK, or the macro slot for C_MACRO, << 8)
+     UITouch *_stick[2]; CGPoint _stickNow[2];      // the touch holding each stick and where it is now (0 left, 1 right)
+     CGPoint _rCentre;                              // the right stick's centre: where its touch landed, dragged along past K_RSTICK_R
+-    uint64_t _faceBits, _dpadBits, _btnBits;
++    uint64_t _faceBits, _dpadBits, _btnBits, _macroBits;
+     NSMapTable<UITouch *, NSNumber *> *_faceOf;    // which keys each touch on the diamond currently holds
+     CAShapeLayer *_key[B_N]; CATextLayer *_label[B_N];   // one layer per key
+     CAShapeLayer *_ring, *_knob;                   // the left stick (the right one is not drawn)
++    CAShapeLayer *_macroLayer[DM_PAD_MACRO_MAX];   // custom macro button circles
++    CATextLayer *_macroLabel[DM_PAD_MACRO_MAX];    // custom macro button labels ("X+A", etc.)
++    CATextLayer *_macroBadge[DM_PAD_MACRO_MAX];    // small mode tag ("TGL" / "TRB") for toggle & turbo macros
++    uint32_t _macroHeldMask, _macroLatchedMask;    // currently held macro slots / currently latched toggle macro slots
++    dispatch_source_t _turboTimer;                 // rapid-fire pulse timer active only while a Turbo macro is held
++    BOOL _turboPhase;                              // YES during the pressed half-cycle of Turbo
+     CALayer *_hint; CATextLayer *_hintText; NSString *_hintWords;   // the 3D layout's right-stick hint: words only, once per launch (see "The right-stick hint")
+     DmMenuButton *_menu;                           // opens the in-game menu (GameMenu.swift)
+     UIView *_padHint; CAShapeLayer *_padHintBg;    // controller quit hint below _menu: shown once per launch with keycap pills, fades with _menu
+@@ -182,12 +646,25 @@ static void pads_start(void);   // Physical controllers, below
+     DmLayout _layout;
+     DmPadOptions _opts;                            // the player's options from the environment (DM_TOUCH_SIZE, DM_TOUCH_STICK, DM_TOUCH_LAYOUT)
+     DmPadLayout _arrangement;                      // DM_TOUCH_LAYOUT, which _opts.layout points to
++    DmPadCustom _custom;                           // per-control custom scales (40%..400%) & fine offsets
++    DmPadMacros _macros;                           // custom macro buttons (up to 12 per layout set)
++    BOOL _hasCustomEdits;                          // whether _opts.custom is active
      DmPadGeo _geo; CGRect _geoBounds; UIEdgeInsets _geoInsets; BOOL _geoFull, _geoValid;   // where the controls are, and what it was computed for
      unsigned _loggedDropped;                       // the moved controls that kept their place, as last logged
      UITouch *_game[16];                           // touches on the game's touch screen by finger slot
 +    CGFloat _opacity;                              // the controls' opacity (1 = as built; the layout editor's slider), applied to _controls
-+    BOOL _editing, _editApart;                     // the layout editor is open / the diamond's keys move one by one
++    BOOL _editing, _editApart;                     // the layout editor is open / the diamond's keys edit one by one
 +    DmPadEditCard *_editCard; BOOL _editCardPlaced;
++    DmPadMacroCard *_macroCard; int _macroEditIdx; BOOL _macroCardLifted; // custom macro builder modal (-1 adding, >=0 editing)
 +    CALayer *_editScrim; CAShapeLayer *_editHalo;  // the dimmed picture behind the controls, the dashed outline of the selected control
-+    int _editSel, _editControl;                    // the selected control (DM_PAD_C_*, -1 none), the one the finger holds
++    int _editSel, _editControl;                    // selected control (0..DM_PAD_C_N-1 built-in, DM_PAD_C_N+idx macro, -1 none), active drag control
 +    UITouch *_editTouch; CGPoint _editGrab, _editStartPos, _editBase;   // the finger, where it landed, where the control was, where it sits with no move of its own
-+    DmPadLayout _editStart; CGFloat _editStartScale, _editStartOpacity; // what Cancel goes back to
++    DmPadLayout _editStart; DmPadCustom _editStartCustom; DmPadMacros _editStartMacros;
++    CGFloat _editStartScale, _editStartOpacity; BOOL _editStartHasCustom;   // what Cancel goes back to
  }
  
  static UIColor *k_idle, *k_on, *k_line, *k_ringFill, *k_text, *k_textOn;
-@@ -213,7 +327,8 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
++static UIColor *k_macroIdle, *k_macroOn, *k_macroLine, *k_toggleIdle, *k_toggleOn, *k_toggleLine, *k_turboIdle, *k_turboOn, *k_turboLine;
+ static CAShapeLayer *shape(CALayer *parent) {
+     CAShapeLayer *l = [CAShapeLayer layer];
+     l.fillColor = k_idle.CGColor; l.strokeColor = k_line.CGColor; l.lineWidth = 1.5;
+@@ -213,7 +690,8 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
          const char *arrangement = getenv("DM_TOUCH_LAYOUT");
          if (!dm_pad_layout_parse(arrangement, &_arrangement)) LOG("front end: DM_TOUCH_LAYOUT ignored (not a layout the engine reads, %zu characters): every control keeps its place", strlen(arrangement));
          else if (dm_pad_layout_count(&_arrangement)) LOG("front end: touch controls arranged by the player (DM_TOUCH_LAYOUT, %d moved over every layout)", dm_pad_layout_count(&_arrangement));
 -        _opts.layout = &_arrangement;
-+        _opts.layout = &_arrangement; _opacity = 1;
++        _opts.layout = &_arrangement; _opacity = 1; _macroEditIdx = -1;
 +        [self loadEdits];
          [self registerForTraitChanges:@[UITraitDisplayScale.class] withHandler:^(id<UITraitEnvironment> environment, UITraitCollection *previous) {
              [(UIView *)environment setNeedsLayout];
          }];
-@@ -230,6 +345,7 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+@@ -228,8 +706,15 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+             // each colour carries its own low opacity instead of lowering the whole view's alpha (that would add an off-screen pass for the full-screen layer)
+             k_idle = [UIColor colorWithWhite:1 alpha:0.14]; k_on = [UIColor colorWithWhite:1 alpha:0.45]; k_line = [UIColor colorWithWhite:1 alpha:0.38];
              k_ringFill = [UIColor colorWithWhite:1 alpha:0.06]; k_text = [UIColor colorWithWhite:1 alpha:0.6]; k_textOn = [UIColor colorWithWhite:0 alpha:0.7];
++            k_macroIdle = [UIColor colorWithRed:0.30 green:0.78 blue:1.0 alpha:0.20]; k_macroOn = [UIColor colorWithRed:0.35 green:0.84 blue:1.0 alpha:0.56];
++            k_macroLine = [UIColor colorWithRed:0.45 green:0.86 blue:1.0 alpha:0.62];
++            k_toggleIdle = [UIColor colorWithRed:1.0 green:0.76 blue:0.28 alpha:0.20]; k_toggleOn = [UIColor colorWithRed:1.0 green:0.80 blue:0.32 alpha:0.60];
++            k_toggleLine = [UIColor colorWithRed:1.0 green:0.82 blue:0.40 alpha:0.66];
++            k_turboIdle = [UIColor colorWithRed:0.32 green:0.90 blue:0.58 alpha:0.20]; k_turboOn = [UIColor colorWithRed:0.38 green:0.94 blue:0.64 alpha:0.58];
++            k_turboLine = [UIColor colorWithRed:0.45 green:0.94 blue:0.68 alpha:0.64];
          }
          _controls = [CALayer layer]; [self.layer addSublayer:_controls];
 +        _controls.allowsGroupOpacity = NO; _controls.opacity = _opacity;   // each shape fades by itself: no off-screen pass for the full-screen layer
          _ring = shape(_controls); _ring.fillColor = k_ringFill.CGColor;
          _knob = shape(_controls);
          CAShapeLayer *in = [CAShapeLayer layer]; in.fillColor = nil; in.strokeColor = k_line.CGColor; in.lineWidth = 1.5;   // inner ring of the knob
-@@ -314,7 +430,7 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+@@ -239,6 +724,11 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+             _key[b] = shape(_controls);
+             if (names[b]) _label[b] = label(_key[b], names[b]);   // the D-pad arms carry no label
+         }
++        for (int i = 0; i < DM_PAD_MACRO_MAX; i++) {
++            _macroLayer[i] = shape(_controls); _macroLayer[i].hidden = YES;
++            _macroLabel[i] = label(_macroLayer[i], @"");
++            _macroBadge[i] = label(_macroLayer[i], @""); _macroBadge[i].hidden = YES;
++        }
+         _menu = [DmMenuButton buttonWithType:UIButtonTypeCustom];
+         _menu.backgroundColor = k_idle; _menu.layer.borderColor = k_line.CGColor; _menu.layer.borderWidth = 1.5;
+         _menu.layer.shadowColor = UIColor.blackColor.CGColor; _menu.layer.shadowOpacity = 0.2; _menu.layer.shadowRadius = 3; _menu.layer.shadowOffset = CGSizeMake(0, 1);
+@@ -276,10 +766,20 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+     }
+     return self;
+ }
++- (void)dealloc { [self stopTurboTimer]; }
++- (void)stopTurboTimer {
++    if (_turboTimer) { dispatch_source_cancel(_turboTimer); _turboTimer = nil; }
++    _turboPhase = NO;
++}
+ - (void)applyLayout {   // show / hide the controls for the current layout
++    int set = [self editSet];
+     [CATransaction begin]; [CATransaction setDisableActions:YES];
+     for (int b = 0; b < B_N; b++) _key[b].hidden = _tap || (fullOnly(b) && !_full);
+     _ring.hidden = _knob.hidden = _tap;
++    for (int i = 0; i < DM_PAD_MACRO_MAX; i++) {
++        const DmPadMacro *m = &_macros.items[set][i];
++        _macroLayer[i].hidden = _tap || !m->active || !(m->mask & 0xFFFFu);
++    }
+     [CATransaction commit];
+ }
+ - (int)padLayout { return _tap ? 2 : _full ? 1 : 0; }
+@@ -305,7 +805,10 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+         && _layout.topSafeOnly == layout.topSafeOnly && _layout.customControlsFullBounds == layout.customControlsFullBounds
+         && _layout.onTV == layout.onTV) return;
+     [self reset];   // A finger held across a pose change must not leave a key or game touch stuck.
++    _editTouch = nil; _editControl = -1;
+     _layout = layout; _geoValid = NO;
++    [self applyLayout];
++    if (_editing) [self editSyncCard];
+     [self updateControlVisibility];
+     [self setNeedsLayout];
+ }
+@@ -314,7 +817,7 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
      if (!_geoValid || !CGRectEqualToRect(b, _geoBounds) || !UIEdgeInsetsEqualToEdgeInsets(i, _geoInsets) || _geoFull != _full) {
          _geo = dm_pad_geo(b, i, _layout, _full, _opts);
          _geoBounds = b; _geoInsets = i; _geoFull = _full; _geoValid = YES;
@@ -218,15 +671,145 @@ index 9860743..ee6ebb4 100644
              _loggedDropped = _geo.dropped;
              NSMutableArray<NSString *> *names = [NSMutableArray array];
              for (int c = 0; c < DM_PAD_C_N; c++) if (_geo.dropped & (1u << c)) [names addObject:@(dm_pad_control_names[c])];
-@@ -443,6 +559,7 @@ int front_web_touch(void);
+@@ -354,9 +857,28 @@ static int lockedKey(int c) {   // DmPadGeometry.h's control → the key it pres
+     if (_tap || _padOff || (_layout.separated && !CGRectContainsPoint(_layout.controls, p))) return YES;
+     return dm_pad_menu_takes(self.geo, _full, _layout.separated, p);
+ }
+-- (uint64_t)faceAt:(CGPoint)p {   // keys under the finger in the diamond (between two keys both count)
+-    uint64_t m = 0; CGFloat r = self.faceHitR;
+-    for (int b = B_A; b <= B_Y; b++) if (dist(p, [self facePos:b]) <= r) m |= 1ull << b;
++- (uint64_t)faceAt:(CGPoint)p {   // keys under the finger in the diamond (between two keys both count; overlapping custom-sized split keys pick the nearest centre ratio)
++    const DmPadGeo *g = self.geo;
++    uint64_t m = 0; int hits[4], nh = 0;
++    for (int b = B_A; b <= B_Y; b++) {
++        int k = b - B_A;
++        if (dist(p, dm_pad_face_key(g, k)) <= g->faceKeyHitR[k]) { m |= 1ull << b; hits[nh++] = k; }
++    }
++    if (nh > 1 && g->customActive && g->faceSplit) {
++        BOOL overlap = NO;
++        for (int i = 0; i < nh && !overlap; i++) for (int j = i + 1; j < nh; j++) {
++            int a = hits[i], b = hits[j];
++            if (dist(dm_pad_face_key(g, a), dm_pad_face_key(g, b)) < g->faceKeyR[a] + g->faceKeyR[b]) overlap = YES;
++        }
++        if (overlap) {
++            int best = hits[0]; CGFloat bestNorm = CGFLOAT_MAX;
++            for (int i = 0; i < nh; i++) {
++                int k = hits[i]; CGFloat n = dist(p, dm_pad_face_key(g, k)) / fmax(g->faceKeyR[k], 1);
++                if (n < bestNorm) { bestNorm = n; best = k; }
++            }
++            return 1ull << (B_A + best);
++        }
++    }
+     return m;
+ }
+ - (uint64_t)dpadAt:(CGPoint)p {   // 8 directions: 45° each, diagonals press two keys; a small centre circle counts as none
+@@ -379,10 +901,43 @@ static int lockedKey(int c) {   // DmPadGeometry.h's control → the key it pres
+ // ---- Touch ----
+ - (void)recompute {
+     uint64_t face = 0; for (UITouch *t in _faceOf) face |= [_faceOf objectForKey:t].unsignedLongLongValue;
+-    uint64_t btn = 0, dpad = 0;
++    uint64_t btn = 0, dpad = 0; uint32_t mHeld = 0;
+     for (UITouch *t in _owner) { uint64_t v = [_owner objectForKey:t].unsignedLongLongValue; int c = (int)(v & 0xff);
+         if (c == C_BTN) btn |= 1ull << (v >> 8);
+-        else if (c == C_DPAD) dpad |= [self dpadAt:[t locationInView:self]]; }
++        else if (c == C_DPAD) dpad |= [self dpadAt:[t locationInView:self]];
++        else if (c == C_MACRO) { int idx = (int)(v >> 8); if (idx >= 0 && idx < DM_PAD_MACRO_MAX) mHeld |= 1u << idx; } }
++    uint64_t macro = 0; BOOL needTurbo = NO;
++    int set = [self editSet];
++    for (int i = 0; i < DM_PAD_MACRO_MAX; i++) {
++        const DmPadMacro *m = &_macros.items[set][i];
++        if (_tap || _padOff || !m->active || !(m->mask & 0xFFFFu)) { _macroLatchedMask &= ~(1u << i); continue; }
++        BOOL held = ((mHeld >> i) & 1u) != 0;
++        if (m->mode == DM_PAD_MACRO_TOGGLE) {
++            if ((_macroLatchedMask >> i) & 1u) macro |= m->mask;
++        } else if (m->mode == DM_PAD_MACRO_TURBO) {
++            if (held) { needTurbo = YES; if (_turboPhase) macro |= m->mask; }
++        } else if (held) {
++            macro |= m->mask;
++        }
++    }
++    if (needTurbo && !_turboTimer) {
++        _turboPhase = YES;
++        for (int i = 0; i < DM_PAD_MACRO_MAX; i++) {
++            const DmPadMacro *m = &_macros.items[set][i];
++            if (!_tap && !_padOff && m->active && m->mode == DM_PAD_MACRO_TURBO && ((mHeld >> i) & 1u)) macro |= m->mask;
++        }
++        __weak DmGamepad *weak = self;
++        dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
++        dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 45 * NSEC_PER_MSEC), 45 * NSEC_PER_MSEC, 5 * NSEC_PER_MSEC);
++        dispatch_source_set_event_handler(timer, ^{
++            DmGamepad *s = weak; if (!s) return;
++            s->_turboPhase = !s->_turboPhase; [s recompute];
++        });
++        _turboTimer = timer;
++        dispatch_resume(timer);
++    } else if (!needTurbo && _turboTimer) {
++        [self stopTurboTimer];
++    }
+     int32_t ax[4] = {0};
+     for (int i = 0; i < 2; i++) {
+         CGPoint o = [self knobOffset:i]; CGFloat R = [self stickR:i], d = hypot(o.x, o.y), dz = R * K_DEAD;
+@@ -390,16 +945,17 @@ static int lockedKey(int c) {   // DmPadGeometry.h's control → the key it pres
+         CGFloat m = fmin((d - dz) / (R * K_FULL - dz), 1) / d;   // outside the dead zone: 0 rising to full at the full-tilt radius
+         ax[i * 2] = (int32_t)lrint(o.x * m * 32767); ax[i * 2 + 1] = (int32_t)lrint(-o.y * m * 32767);   // host: up is positive; rounded so full tilt is exactly 32767
+     }
+-    BOOL changed = face != _faceBits || dpad != _dpadBits || btn != _btnBits;
++    BOOL changed = face != _faceBits || dpad != _dpadBits || btn != _btnBits || macro != _macroBits || mHeld != _macroHeldMask;
+     uint64_t pressed = (face | dpad | btn) & ~(_faceBits | _dpadBits | _btnBits);
++    uint32_t macroPressed = mHeld & ~_macroHeldMask;
+     unsigned gripping = (_stick[0] ? 1u : 0) | (_stick[1] ? 2u : 0);
+-    if (pressed || (gripping & ~_hapticSticks)) {
++    if (pressed || macroPressed || (gripping & ~_hapticSticks)) {
+         [_touchFeedback impactOccurredWithIntensity:0.6]; [_touchFeedback prepare];
+     }
+     _hapticSticks = gripping;
+-    _faceBits = face; _dpadBits = dpad; _btnBits = btn;
++    _faceBits = face; _dpadBits = dpad; _btnBits = btn; _macroBits = macro; _macroHeldMask = mHeld;
+     pthread_mutex_lock(&g_mu);
+-    g_touch_btn = face | dpad | btn; g_touch_lx = ax[0]; g_touch_ly = ax[1]; g_touch_rx = ax[2]; g_touch_ry = ax[3];
++    g_touch_btn = face | dpad | btn | macro; g_touch_lx = ax[0]; g_touch_ly = ax[1]; g_touch_rx = ax[2]; g_touch_ry = ax[3];
+     pthread_mutex_unlock(&g_mu);
+     publish();
+     BOOL stick = _stick[0] != nil;   // only the left stick is drawn: the right one needs no refresh
+@@ -428,6 +984,7 @@ int front_web_touch(void);
+ - (BOOL)controlAt:(CGPoint)p {
+     if (_padOff || (_layout.separated && !CGRectContainsPoint(_layout.controls, p))) return NO;
+     if (_tap) return NO;
++    if (dm_pad_macro_hit(self.geo, _layout.separated, _layout.controls, &_macros, [self editSet], p, NULL) >= 0) return YES;
+     if (dm_pad_hit(self.geo, _full, _layout.separated, _tap, !_stick[0], p).kind != DM_PAD_HIT_NONE) return YES;   // the geometry touchesBegan hits with (DmPadGeometry.h)
+     return _full && !_stick[1] && [self inRightArea:p];
+ }
+@@ -443,12 +1000,29 @@ int front_web_touch(void);
      return v;
  }
  - (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
 +    if (_editing) { [self editBegan:ts]; return; }
      if (_padOff && !_layout.onTV) [self wakeMenu];
      BOOL game = NO;
++    int set = [self editSet];
      for (UITouch *t in ts) {
-@@ -463,6 +580,7 @@ int front_web_touch(void);
+         if (_padOff) { game |= [self gameBegin:t]; continue; }
+         CGPoint p = [t locationInView:self];
+         if (_layout.separated && !CGRectContainsPoint(_layout.controls, p)) { game |= [self gameBegin:t]; continue; }
++        if (!_tap) {
++            CGFloat md = CGFLOAT_MAX;
++            int mi = dm_pad_macro_hit(self.geo, _layout.separated, _layout.controls, &_macros, set, p, &md);
++            if (mi >= 0) {
++                CGFloat kd = CGFLOAT_MAX;
++                int lk = dm_pad_locked_at(self.geo, _full, _layout.separated, p, &kd);
++                if (lk < 0 || md <= kd) {
++                    [_owner setObject:@(C_MACRO | (uint64_t)mi << 8) forKey:t];
++                    int mode = _macros.items[set][mi].mode;
++                    if (mode == DM_PAD_MACRO_TOGGLE) _macroLatchedMask ^= (1u << mi);
++                    else if (mode == DM_PAD_MACRO_TURBO) _turboPhase = YES;
++                    continue;
++                }
++            }
++        }
+         DmPadHit hit = dm_pad_hit(self.geo, _full, _layout.separated, _tap, !_stick[0], p);   // the same geometry the controls are drawn with (the menu button took its own touches, menuTakes)
+         if (hit.kind == DM_PAD_HIT_KEY) { [_owner setObject:@(C_BTN | (uint64_t)lockedKey(hit.key) << 8) forKey:t]; continue; }
+         if (_tap) { game |= [self gameBegin:t]; continue; }
+@@ -463,6 +1037,7 @@ int front_web_touch(void);
      [self recompute];
  }
  - (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
@@ -234,18 +817,112 @@ index 9860743..ee6ebb4 100644
      BOOL game = NO;
      for (UITouch *t in ts) {
          uint64_t v = [_owner objectForKey:t].unsignedLongLongValue; int c = (int)(v & 0xff); CGPoint p = [t locationInView:self];
-@@ -485,8 +603,8 @@ int front_web_touch(void);
+@@ -485,9 +1060,14 @@ int front_web_touch(void);
      if (game) [self pushGame];
      [self recompute];
  }
 -- (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self endTouches:ts tapped:YES]; }
 -- (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self endTouches:ts tapped:NO]; }
+-- (void)reset { [_owner removeAllObjects]; [_faceOf removeAllObjects]; _stick[0] = _stick[1] = nil; for (int i = 0; i < 16; i++) _game[i] = nil; [self pushGame]; [self recompute]; }
 +- (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { if (_editing) { [self editEnded:ts]; return; } [self endTouches:ts tapped:YES]; }
 +- (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { if (_editing) { [self editEnded:ts]; return; } [self endTouches:ts tapped:NO]; }
- - (void)reset { [_owner removeAllObjects]; [_faceOf removeAllObjects]; _stick[0] = _stick[1] = nil; for (int i = 0; i < 16; i++) _game[i] = nil; [self pushGame]; [self recompute]; }
++- (void)reset {
++    [_owner removeAllObjects]; [_faceOf removeAllObjects]; _stick[0] = _stick[1] = nil;
++    _macroLatchedMask = 0; [self stopTurboTimer];
++    for (int i = 0; i < 16; i++) _game[i] = nil;
++    [self pushGame]; [self recompute];
++}
  
  // ---- Shapes ----
-@@ -553,12 +671,167 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
+ static CGPathRef circlePath(CGPoint c, CGFloat r) { return CGPathCreateWithEllipseInRect(CGRectMake(c.x - r, c.y - r, 2 * r, 2 * r), NULL); }
+@@ -519,46 +1099,517 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
+     CFRelease(f);
+ }
+ 
++static void placeFittedLabel(CATextLayer *t, NSString *text, CGPoint c, CGFloat maxWidth, CGFloat idealFs, CGFloat minFs) {
++    CGFloat fs = idealFs;
++    UIFont *uf = [UIFont systemFontOfSize:fs weight:UIFontWeightSemibold];
++    CGSize sz = [text sizeWithAttributes:@{NSFontAttributeName: uf}];
++    if (sz.width > maxWidth && sz.width > 0) fs = fmax(minFs, fs * (maxWidth / sz.width));
++    CTFontRef f = CTFontCreateUIFontForLanguage(kCTFontUIFontEmphasizedSystem, fs, NULL);
++    t.string = text; t.font = f; t.fontSize = fs; t.truncationMode = kCATruncationEnd;
++    CGFloat h = CTFontGetAscent(f) + CTFontGetDescent(f) + CTFontGetLeading(f);
++    t.frame = CGRectMake(c.x - maxWidth / 2, c.y - h / 2, maxWidth, h);
++    CFRelease(f);
++}
++
+ - (void)layoutSubviews {
+     [super layoutSubviews];
+     UIWindowScene *ws = self.window.windowScene; if (ws) atomic_store(&g_iface_orient, (int)ws.effectiveGeometry.interfaceOrientation);
+-    CGFloat u = self.u;
++    const DmPadGeo *g = self.geo;
++    CGFloat u = g->u, bu = g->baseU > 0 ? g->baseU : u;
+     [CATransaction begin]; [CATransaction setDisableActions:YES];
+     CGFloat scale = MAX(self.traitCollection.displayScale, 1);
+     for (int b = 0; b < B_N; b++) if (_label[b] && _label[b].contentsScale != scale) {
+         _label[b].contentsScale = scale; [_label[b] setNeedsDisplay];
+     }
++    for (int i = 0; i < DM_PAD_MACRO_MAX; i++) {
++        if (_macroLabel[i].contentsScale != scale) { _macroLabel[i].contentsScale = scale; [_macroLabel[i] setNeedsDisplay]; }
++        if (_macroBadge[i].contentsScale != scale) { _macroBadge[i].contentsScale = scale; [_macroBadge[i] setNeedsDisplay]; }
++    }
+     _controls.frame = self.layer.bounds;
+-    for (int b = B_A; b <= B_Y; b++) { CGPoint c = [self facePos:b]; setPath(_key[b], circlePath(c, self.faceR)); placeLabel(_label[b], c, 20 * u); }
++    for (int b = B_A; b <= B_Y; b++) {
++        int k = b - B_A; CGPoint c = [self facePos:b]; CGFloat r = g->faceKeyR[k], ku = r / DM_PAD_FACE_R;
++        setPath(_key[b], circlePath(c, r)); placeLabel(_label[b], c, 20 * ku);
++    }
+     for (int i = 0; i < (int)(sizeof k_btns / sizeof *k_btns); i++) { int b = k_btns[i];
+         if (isDrop(b)) {
+-            BOOL right = b == B_ZR || b == B_R; CGPoint c = [self dropCenter:b];
+-            setPath(_key[b], dropPath(c, [self dropR:b], right ? -M_PI_4 : -3 * M_PI_4, 4 * u)); placeLabel(_label[b], c, 16 * u);   // tip toward the near top corner
++            BOOL right = b == B_ZR || b == B_R, z = b == B_ZL || b == B_ZR;
++            CGPoint c = [self dropCenter:b]; CGFloat r = [self dropR:b], ku = r / (z ? DM_PAD_ZL_R : DM_PAD_L_R);
++            setPath(_key[b], dropPath(c, r, right ? -M_PI_4 : -3 * M_PI_4, 4 * ku)); placeLabel(_label[b], c, 16 * ku);   // tip toward the near top corner
+         } else if (isClick(b)) {
+-            CGPoint c = [self clickCenter:b]; setPath(_key[b], circlePath(c, self.geo->clickR)); placeLabel(_label[b], c, 13 * u);
++            CGPoint c = [self clickCenter:b]; CGFloat r = g->clickKeyR[b == B_RS], ku = r / DM_PAD_CLICK_R;
++            setPath(_key[b], circlePath(c, r)); placeLabel(_label[b], c, 13 * ku);
+         } else {
+-            CGRect rc = [self pillRect:b];
+-            setPath(_key[b], CGPathCreateWithRoundedRect(rc, rc.size.height / 2, rc.size.height / 2, NULL)); placeLabel(_label[b], CGPointMake(CGRectGetMidX(rc), CGRectGetMidY(rc)), 18 * u);
++            CGRect rc = [self pillRect:b]; CGFloat ku = rc.size.height / DM_PAD_PILL_H;
++            setPath(_key[b], CGPathCreateWithRoundedRect(rc, rc.size.height / 2, rc.size.height / 2, NULL)); placeLabel(_label[b], CGPointMake(CGRectGetMidX(rc), CGRectGetMidY(rc)), 18 * ku);
+         }
+     }
+     static const struct { int b; CGFloat angle; } arms[] = {{B_UP, 0}, {B_RIGHT, M_PI_2}, {B_DOWN, M_PI}, {B_LEFT, -M_PI_2}};   // the same arm in 90° steps
+-    for (int i = 0; i < 4; i++) setPath(_key[arms[i].b], armPath(self.dpadCenter, self.dpadR, self.geo->armW, self.geo->armIn, arms[i].angle, 6 * u));
+-    CGFloat mr = self.geo->swapR; CGPoint mc = self.menuCenter;
++    CGFloat du = g->dpadR / DM_PAD_DPAD_R;
++    for (int i = 0; i < 4; i++) setPath(_key[arms[i].b], armPath(self.dpadCenter, g->dpadR, g->armW, g->armIn, arms[i].angle, 6 * du));
++    int set = [self editSet];
++    for (int i = 0; i < DM_PAD_MACRO_MAX; i++) {
++        const DmPadMacro *m = &_macros.items[set][i];
++        BOOL active = !_tap && m->active && (m->mask & 0xFFFFu);
++        _macroLayer[i].hidden = !active;
++        if (!active) continue;
++        CGFloat r = 0;
++        CGPoint mc = dm_pad_macro_center(g, _layout.separated, _layout.controls, m, &r);
++        setPath(_macroLayer[i], circlePath(mc, r));
++        BOOL tagged = m->mode == DM_PAD_MACRO_TOGGLE || m->mode == DM_PAD_MACRO_TURBO;
++        CGFloat mu = r / DM_PAD_FACE_R;
++        NSString *txt = @(m->label[0] ? m->label : "M");
++        placeFittedLabel(_macroLabel[i], txt, CGPointMake(mc.x, mc.y - (tagged ? r * 0.14 : 0)), r * 1.68, fmax(8, 16 * mu), fmax(6, 8 * mu));
++        _macroBadge[i].hidden = !tagged;
++        if (tagged) {
++            NSString *tag = m->mode == DM_PAD_MACRO_TOGGLE ? @"TGL" : @"TRB";
++            placeFittedLabel(_macroBadge[i], tag, CGPointMake(mc.x, mc.y + r * 0.44), r * 1.2, fmax(6.5, 8.5 * mu), 6);
++        }
++    }
++    CGFloat mr = g->swapR; CGPoint mc = self.menuCenter;
+     _menu.frame = CGRectMake(mc.x - mr, mc.y - mr, 2 * mr, 2 * mr); _menu.layer.cornerRadius = mr;
+     _menu.layer.shadowPath = [UIBezierPath bezierPathWithOvalInRect:_menu.bounds].CGPath;
+-    [_menu setImage:[UIImage systemImageNamed:@"gearshape.fill" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:13 * u weight:UIImageSymbolWeightSemibold]] forState:UIControlStateNormal];
++    [_menu setImage:[UIImage systemImageNamed:@"gearshape.fill" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:13 * bu weight:UIImageSymbolWeightSemibold]] forState:UIControlStateNormal];
+     setPath(_ring, circlePath(self.stickHome, [self stickR:0]));
+-    CGFloat k = self.geo->knobR; _knob.bounds = CGRectMake(0, 0, 2 * k, 2 * k);
++    CGFloat k = g->knobR; _knob.bounds = CGRectMake(0, 0, 2 * k, 2 * k);
+     setPath(_knob, circlePath(CGPointMake(k, k), k));
      CAShapeLayer *in = (CAShapeLayer *)_knob.sublayers.firstObject; CGPathRef ip = circlePath(CGPointMake(k, k), k * 0.62);
      in.frame = _knob.bounds; in.path = ip; CGPathRelease(ip);
      [CATransaction commit];
@@ -257,134 +934,396 @@ index 9860743..ee6ebb4 100644
  }
  
 +// ---- Editing the layout in the game ----
-+// "Edit control layout" in the in-game menu (GameMenu.swift, dm_pad_edit_begin) works in a game's own app, which has no shell and so no layout editor of its own, as in the shell.
-+// The picture dims, every control of the current layout (2D or 3D) can be dragged to where the player wants it, and a card holds one size for all the controls (DM_TOUCH_SIZE's
-+// factor, continuous), one opacity and Reset, Cancel and Done. The moves are the shell editor's: DM_TOUCH_LAYOUT's steps, a quarter of a face key's width each, and the geometry
-+// (DmPadGeometry.h) keeps a control inside its area and clear of the others, so a drag that has no room stops at the last place that has (it slides along what blocks it).
-+// Done saves the arrangement, the size and the opacity in NSUserDefaults (loadEdits reads them at the next start). A change of DM_TOUCH_LAYOUT or DM_TOUCH_SIZE in the environment
-+// (the shell's settings) after that drops the saved edits. Touches belong to the editor while it is open: no key is pressed and nothing reaches the game.
++// "Edit control layout" in the in-game menu (GameMenu.swift, dm_pad_edit_begin) supports global and per-control resizing (40%..400%),
++// free pixel-accurate drag positioning inside the screen bounds, Split ABXY for individual A/B/X/Y editing, opacity (15%..100%),
++// and custom multi-button macro buttons (Hold / Toggle / Turbo, e.g. X+A). Done saves all settings in NSUserDefaults (loadEdits reads
++// them at the next start). If DM_TOUCH_LAYOUT or DM_TOUCH_SIZE in the environment changed from the shell, saved layout/size edits drop so
++// the shell's settings win, while custom macro buttons are preserved.
 +static NSString *edit_env_stamp(void) {
 +    const char *l = getenv("DM_TOUCH_LAYOUT"), *s = getenv("DM_TOUCH_SIZE");
 +    return [NSString stringWithFormat:@"%s|%s", l ? l : "", s ? s : ""];
 +}
++static NSString *edit_control_display_name(int c) {
++    switch (c) {
++        case DM_PAD_C_STICK: return @"Left Stick";
++        case DM_PAD_C_DPAD: return @"D-Pad";
++        case DM_PAD_C_FACE: return @"ABXY";
++        case DM_PAD_C_A: return @"Button A";
++        case DM_PAD_C_B: return @"Button B";
++        case DM_PAD_C_X: return @"Button X";
++        case DM_PAD_C_Y: return @"Button Y";
++        case DM_PAD_C_ZL: return @"ZL";
++        case DM_PAD_C_L: return @"L";
++        case DM_PAD_C_ZR: return @"ZR";
++        case DM_PAD_C_R: return @"R";
++        case DM_PAD_C_MINUS: return @"Minus (−)";
++        case DM_PAD_C_PLUS: return @"Plus (+)";
++        case DM_PAD_C_L3: return @"L3";
++        case DM_PAD_C_R3: return @"R3";
++        default: return @"All Controls";
++    }
++}
 +- (void)loadEdits {
 +    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
++    NSString *macroText = [d stringForKey:k_edit_macros_key]; DmPadMacros m;
++    if (macroText && dm_pad_macros_parse(macroText.UTF8String, &m)) _macros = m;
 +    NSString *stamp = [d stringForKey:k_edit_stamp_key];
 +    if (!stamp) return;
-+    if (![stamp isEqualToString:edit_env_stamp()]) {   // the shell's settings changed since: its values win
-+        for (NSString *k in @[k_edit_layout_key, k_edit_scale_key, k_edit_opacity_key, k_edit_stamp_key]) [d removeObjectForKey:k];
++    if (![stamp isEqualToString:edit_env_stamp()]) {   // the shell's settings changed since: its layout/size win (custom macros are kept)
++        for (NSString *k in @[k_edit_layout_key, k_edit_scale_key, k_edit_opacity_key, k_edit_custom_key, k_edit_stamp_key]) [d removeObjectForKey:k];
 +        LOG("front end: saved layout edits dropped (DM_TOUCH_LAYOUT or DM_TOUCH_SIZE changed)");
 +        return;
 +    }
 +    NSString *text = [d stringForKey:k_edit_layout_key]; DmPadLayout l;
 +    if (text && dm_pad_layout_parse(text.UTF8String, &l)) _arrangement = l;
++    NSString *customText = [d stringForKey:k_edit_custom_key]; DmPadCustom cu;
++    if (customText && dm_pad_custom_parse(customText.UTF8String, &cu)) _custom = cu;
 +    double scale = [d doubleForKey:k_edit_scale_key], opacity = [d doubleForKey:k_edit_opacity_key];
 +    if (scale >= k_edit_scale_min && scale <= k_edit_scale_max) _opts.scale = scale;
 +    if (opacity >= k_edit_opacity_min && opacity <= 1) _opacity = opacity;
-+    LOG("front end: touch layout edits loaded (size %.0f%%, opacity %.0f%%, %d moved)", _opts.scale * 100, _opacity * 100, dm_pad_layout_count(&_arrangement));
++    _hasCustomEdits = dm_pad_custom_count(&_custom) > 0 || fabs((_opts.scale > 0 ? _opts.scale : 1) - 1) > 0.001;
++    _opts.custom = _hasCustomEdits ? &_custom : NULL;
++    LOG("front end: touch layout edits loaded (size %.0f%%, opacity %.0f%%, %d custom, %d macros)",
++        _opts.scale * 100, _opacity * 100, dm_pad_custom_count(&_custom), dm_pad_macros_count(&_macros));
 +}
 +- (BOOL)editOffered { return !_tap; }
 +- (int)editSet { return (_layout.separated ? DM_PAD_SET_2D_SPLIT : DM_PAD_SET_2D) + (_full ? 1 : 0); }
 +- (void)beginEditing {
 +    if (_editing || _tap) return;
 +    [self reset];
-+    _editing = YES; _editSel = -1; _editControl = -1; _editTouch = nil; _editApart = NO; _editCardPlaced = NO;
-+    _editStart = _arrangement; _editStartScale = _opts.scale > 0 ? _opts.scale : 1; _editStartOpacity = _opacity;
-+    _editScrim = [CALayer layer]; _editScrim.backgroundColor = [UIColor colorWithWhite:0 alpha:0.4].CGColor; [self.layer insertSublayer:_editScrim atIndex:0];
-+    _editHalo = [CAShapeLayer layer]; _editHalo.fillColor = nil; _editHalo.strokeColor = [UIColor colorWithWhite:1 alpha:0.95].CGColor; _editHalo.lineWidth = 2;
-+    _editHalo.lineDashPattern = @[@7, @5]; _editHalo.hidden = YES; [self.layer addSublayer:_editHalo];
++    int set = [self editSet];
++    _editing = YES; _editSel = -1; _editControl = -1; _editTouch = nil; _editCardPlaced = NO; _macroEditIdx = -1;
++    _editStart = _arrangement; _editStartCustom = _custom; _editStartMacros = _macros;
++    _editStartScale = _opts.scale > 0 ? _opts.scale : 1; _editStartOpacity = _opacity; _editStartHasCustom = _hasCustomEdits;
++    _editApart = dm_pad_custom_face_split_in_set(&_custom, set) || self.geo->faceSplit;
++    _opts.custom = &_custom; _geoValid = NO;   // active while editing so per-control sizing (40%..400%) & free drag respond live
++    _editScrim = [CALayer layer]; _editScrim.backgroundColor = [UIColor colorWithWhite:0 alpha:0.42].CGColor; [self.layer insertSublayer:_editScrim atIndex:0];
++    _editHalo = [CAShapeLayer layer]; _editHalo.fillColor = nil; _editHalo.strokeColor = [UIColor colorWithRed:0.38 green:0.86 blue:1 alpha:0.96].CGColor;
++    _editHalo.lineWidth = 2.2; _editHalo.lineDashPattern = @[@7, @5]; _editHalo.hidden = YES; [self.layer addSublayer:_editHalo];
 +    _controls.hidden = NO; _menu.userInteractionEnabled = NO;   // the menu button cannot move: it stays, and does nothing, until the editor closes
 +    __weak DmGamepad *weak = self;
-+    DmPadEditCard *card = [[DmPadEditCard alloc] initWithScale:_editStartScale opacity:_opacity min:k_edit_scale_min max:k_edit_scale_max opacityMin:k_edit_opacity_min];
++    DmPadEditCard *card = [[DmPadEditCard alloc] initWithScale:_editStartScale opacity:_opacity apart:_editApart min:k_edit_scale_min max:k_edit_scale_max opacityMin:k_edit_opacity_min];
 +    card.onSize = ^(CGFloat v) { [weak editSetScale:v]; };
 +    card.onOpacity = ^(CGFloat v) { [weak editSetOpacity:v]; };
-+    card.onApart = ^(BOOL on) { DmGamepad *s = weak; if (s) { s->_editApart = on; s->_editSel = -1; [s setNeedsLayout]; } };
-+    card.onReset = ^{ [weak editReset]; };
-+    card.onCancel = ^{ [weak endEditing:NO]; };
-+    card.onDone = ^{ [weak endEditing:YES]; };
++    card.onApart = ^(BOOL on) { [weak editSetApart:on]; };
++    card.onSelectAll = ^{ [weak editSelectControl:-1]; };
++    card.onResetItem = ^{ [weak editResetSelected]; };
++    card.onAddMacro = ^{ [weak editOpenMacroModal:-1]; };
++    card.onEditMacro = ^{ DmGamepad *s = weak; if (s && s->_editSel >= DM_PAD_C_N) [s editOpenMacroModal:s->_editSel - DM_PAD_C_N]; };
++    card.onDeleteMacro = ^{ DmGamepad *s = weak; if (s && s->_editSel >= DM_PAD_C_N) [s editDeleteMacro:s->_editSel - DM_PAD_C_N]; };
++    card.onReset = ^(BOOL includeMacros) { [weak editResetAll:includeMacros]; };
++    card.onCancel = ^{ [weak finishEditingLayout:NO]; };
++    card.onDone = ^{ [weak finishEditingLayout:YES]; };
 +    _editCard = card; [self addSubview:card];
++    [self editSyncCard];
 +    LOG("front end: touch layout editor opened");
 +    [self setNeedsLayout];
 +}
-+- (void)editSetScale:(CGFloat)v { _opts.scale = v; _geoValid = NO; [self setNeedsLayout]; }
++- (void)editSyncCard {
++    if (!_editCard) return;
++    int set = [self editSet], mn = dm_pad_macros_count_in_set(&_macros, set);
++    CGFloat gScale = _opts.scale > 0 ? _opts.scale : 1;
++    if (_editSel >= DM_PAD_C_N) {
++        int idx = _editSel - DM_PAD_C_N;
++        if (idx < 0 || idx >= DM_PAD_MACRO_MAX || !_macros.items[set][idx].active) _editSel = -1;
++    }
++    if (_editSel >= DM_PAD_C_N) {
++        const DmPadMacro *m = &_macros.items[set][_editSel - DM_PAD_C_N];
++        NSString *name = [NSString stringWithFormat:@"Macro: %s", m->label[0] ? m->label : "M"];
++        CGFloat ms = dm_pad_clamp_scale(m->scale > 0 ? m->scale : 1);
++        [_editCard setSelectionName:name isMacro:YES hasSelection:YES scale:ms opacity:_opacity apart:_editApart macroCount:mn];
++    } else if (_editSel >= 0) {
++        CGFloat eff = dm_pad_effective_scale(gScale, &_custom, set, _editSel);
++        [_editCard setSelectionName:edit_control_display_name(_editSel) isMacro:NO hasSelection:YES scale:eff opacity:_opacity apart:_editApart macroCount:mn];
++    } else {
++        [_editCard setSelectionName:@"All Controls" isMacro:NO hasSelection:NO scale:gScale opacity:_opacity apart:_editApart macroCount:mn];
++    }
++}
++- (void)editSelectControl:(int)c {
++    _editSel = c;
++    [self editSyncCard];
++    [self setNeedsLayout];
++}
++- (void)editSetApart:(BOOL)on {
++    _editApart = on;
++    if (on && _editSel == DM_PAD_C_FACE) _editSel = -1;
++    else if (!on && _editSel >= DM_PAD_C_A && _editSel <= DM_PAD_C_Y) _editSel = DM_PAD_C_FACE;
++    [self editSyncCard];
++    [self setNeedsLayout];
++}
++- (void)editSetScale:(CGFloat)v {
++    int set = [self editSet];
++    CGFloat gScale = _opts.scale > 0 ? _opts.scale : 1;
++    v = dm_pad_clamp_scale(v);
++    if (_editSel >= DM_PAD_C_N) {
++        int idx = _editSel - DM_PAD_C_N;
++        if (idx >= 0 && idx < DM_PAD_MACRO_MAX && _macros.items[set][idx].active) _macros.items[set][idx].scale = v;
++    } else if (_editSel >= 0 && _editSel < DM_PAD_C_N) {
++        CGFloat baseScale = gScale;
++        if (_editSel >= DM_PAD_C_A && _editSel <= DM_PAD_C_Y) {
++            CGFloat sf = _custom.scale[set][DM_PAD_C_FACE] > 0 ? _custom.scale[set][DM_PAD_C_FACE] : 1.0;
++            if (v / (gScale * sf) > DM_PAD_REL_SCALE_MAX || v / (gScale * sf) < DM_PAD_REL_SCALE_MIN) {
++                for (int k = DM_PAD_C_A; k <= DM_PAD_C_Y; k++) {
++                    CGFloat sk = (_custom.scale[set][k] > 0 ? _custom.scale[set][k] : 1.0) * sf;
++                    _custom.scale[set][k] = fmax(DM_PAD_REL_SCALE_MIN, fmin(DM_PAD_REL_SCALE_MAX, sk));
++                }
++                _custom.scale[set][DM_PAD_C_FACE] = 0;
++            } else {
++                baseScale = gScale * sf;
++            }
++        }
++        CGFloat rel = fmax(DM_PAD_REL_SCALE_MIN, fmin(DM_PAD_REL_SCALE_MAX, v / baseScale));
++        _custom.scale[set][_editSel] = fabs(rel - 1.0) < 0.002 ? 0 : rel;
++    } else {
++        _opts.scale = v;
++    }
++    _geoValid = NO; [self setNeedsLayout];
++}
 +- (void)editSetOpacity:(CGFloat)v {
 +    _opacity = v;
 +    [CATransaction begin]; [CATransaction setDisableActions:YES]; _controls.opacity = v; [CATransaction commit];
 +}
-+- (void)editReset {   // the current layout's controls back in their built-in places, the built-in size, full opacity
-+    int set = [self editSet];
-+    for (int c = 0; c < DM_PAD_C_N; c++) { _arrangement.dx[set][c] = 0; _arrangement.dy[set][c] = 0; }
-+    _opts.scale = 1; [self editSetOpacity:1]; [_editCard setScale:1 opacity:1];
-+    _editSel = -1; _geoValid = NO; [self setNeedsLayout];
++- (void)editResetSelected {
++    if (_editSel < 0 || _editSel >= DM_PAD_C_N) return;
++    int set = [self editSet], c = _editSel;
++    _custom.scale[set][c] = 0; _custom.hasPos[set][c] = NO; _custom.dx[set][c] = 0; _custom.dy[set][c] = 0;
++    _arrangement.dx[set][c] = 0; _arrangement.dy[set][c] = 0;
++    if (c == DM_PAD_C_FACE) {
++        for (int k = DM_PAD_C_A; k <= DM_PAD_C_Y; k++) {
++            _custom.scale[set][k] = 0; _custom.hasPos[set][k] = NO; _custom.dx[set][k] = 0; _custom.dy[set][k] = 0;
++            _arrangement.dx[set][k] = 0; _arrangement.dy[set][k] = 0;
++        }
++    }
++    _geoValid = NO; [self editSyncCard]; [self setNeedsLayout];
 +}
-+- (void)endEditing:(BOOL)save {
++- (void)editResetAll:(BOOL)includeMacros {   // reset the current layout's positions, sizes and opacity (and optionally custom macros)
++    int set = [self editSet];
++    for (int c = 0; c < DM_PAD_C_N; c++) {
++        _arrangement.dx[set][c] = 0; _arrangement.dy[set][c] = 0;
++        _custom.scale[set][c] = 0; _custom.hasPos[set][c] = NO; _custom.dx[set][c] = 0; _custom.dy[set][c] = 0;
++    }
++    if (includeMacros) {
++        memset(_macros.items[set], 0, sizeof _macros.items[set]);
++    } else {
++        for (int i = 0; i < DM_PAD_MACRO_MAX; i++) if (_macros.items[set][i].active) _macros.items[set][i].scale = 1.0;
++    }
++    _opts.scale = 1; [self editSetOpacity:1]; _editApart = NO;
++    _editSel = -1; _geoValid = NO;
++    [self applyLayout]; [self editSyncCard]; [self setNeedsLayout];
++}
++- (void)editCloseMacroModal {
++    if (!_macroCard) return;
++    [_macroCard removeFromSuperview]; _macroCard = nil; _macroEditIdx = -1; _macroCardLifted = NO;
++    _editCard.hidden = NO;
++}
++- (void)editOpenMacroModal:(int)idx {
++    int set = [self editSet];
++    if (idx < 0 && dm_pad_macros_count_in_set(&_macros, set) >= DM_PAD_MACRO_MAX) return;
++    [self editCloseMacroModal];
++    _macroEditIdx = idx;
++    uint64_t mask = 0; int mode = DM_PAD_MACRO_HOLD; NSString *lbl = nil;
++    if (idx >= 0 && idx < DM_PAD_MACRO_MAX && _macros.items[set][idx].active) {
++        const DmPadMacro *m = &_macros.items[set][idx];
++        mask = m->mask; mode = m->mode; lbl = @(m->label);
++    }
++    __weak DmGamepad *weak = self;
++    DmPadMacroCard *mc = [[DmPadMacroCard alloc] initWithMask:mask mode:mode label:lbl editing:(idx >= 0)];
++    mc.onSave = ^(uint64_t newMask, int newMode, NSString *newLabel) { [weak editSaveMacroMask:newMask mode:newMode label:newLabel]; };
++    mc.onDelete = ^{ DmGamepad *s = weak; if (s && s->_macroEditIdx >= 0) { int di = s->_macroEditIdx; [s editCloseMacroModal]; [s editDeleteMacro:di]; } };
++    mc.onCancel = ^{ [weak editCloseMacroModal]; };
++    _macroCard = mc; _editCard.hidden = YES; [self addSubview:mc];
++    [self editPlaceMacroCard:NO];
++}
++static void copy_utf8_clamped(char *out, size_t cap, NSString *s) {
++    if (!cap) return;
++    const char *utf = s.UTF8String ?: "";
++    size_t len = strlen(utf);
++    if (len >= cap) {
++        len = cap - 1;
++        while (len > 0 && (((unsigned char)utf[len] & 0xC0u) == 0x80u)) len--;   // never cut in the middle of a UTF-8 sequence
++    }
++    memcpy(out, utf, len); out[len] = 0;
++}
++- (void)editSaveMacroMask:(uint64_t)mask mode:(int)mode label:(NSString *)lbl {
++    int set = [self editSet];
++    int idx = _macroEditIdx;
++    if (idx < 0) {
++        for (int i = 0; i < DM_PAD_MACRO_MAX; i++) if (!_macros.items[set][i].active) { idx = i; break; }
++        if (idx < 0) { [self editCloseMacroModal]; return; }
++        DmPadMacro *m = &_macros.items[set][idx];
++        memset(m, 0, sizeof *m);
++        m->active = YES;
++        // Stagger newly added macro buttons across the upper-middle area so multiple additions stay separated and easy to grab.
++        m->nx = 0.50 + ((idx % 3) - 1) * 0.14;
++        m->ny = 0.24 + ((idx / 3) % 3) * 0.16;
++        m->scale = dm_pad_clamp_scale(_opts.scale > 0 ? _opts.scale : 1.0);
++    }
++    DmPadMacro *m = &_macros.items[set][idx];
++    m->active = YES;
++    m->mask = mask & 0xFFFFu;
++    m->mode = (mode >= DM_PAD_MACRO_HOLD && mode <= DM_PAD_MACRO_TURBO) ? mode : DM_PAD_MACRO_HOLD;
++    copy_utf8_clamped(m->label, sizeof m->label, lbl);
++    if (!m->label[0]) dm_pad_macro_default_label(m->mask, m->label, sizeof m->label);
++    [self editCloseMacroModal];
++    _editSel = DM_PAD_C_N + idx;
++    [self applyLayout]; [self editSyncCard]; [self setNeedsLayout];
++}
++- (void)editDeleteMacro:(int)idx {
++    int set = [self editSet];
++    if (idx < 0 || idx >= DM_PAD_MACRO_MAX || !_macros.items[set][idx].active) return;
++    for (int i = idx; i + 1 < DM_PAD_MACRO_MAX; i++) _macros.items[set][i] = _macros.items[set][i + 1];
++    memset(&_macros.items[set][DM_PAD_MACRO_MAX - 1], 0, sizeof(DmPadMacro));
++    _macroLatchedMask = 0;
++    _editSel = -1;
++    [self applyLayout]; [self editSyncCard]; [self setNeedsLayout];
++}
++- (void)finishEditingLayout:(BOOL)save {
 +    if (!_editing) return;
++    [self editCloseMacroModal];
 +    if (save) {
-+        char text[DM_PAD_LAYOUT_MAX + 1];
-+        if (dm_pad_layout_encode(&_arrangement, text, sizeof text) >= 0) {
++        char text[DM_PAD_LAYOUT_MAX + 1], customText[DM_PAD_CUSTOM_MAX + 1], macroText[DM_PAD_MACROS_STR_MAX + 1];
++        if (dm_pad_layout_encode(&_arrangement, text, sizeof text) >= 0 &&
++            dm_pad_custom_encode(&_custom, customText, sizeof customText) >= 0 &&
++            dm_pad_macros_encode(&_macros, macroText, sizeof macroText) >= 0) {
 +            NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
 +            [d setObject:@(text) forKey:k_edit_layout_key]; [d setDouble:_opts.scale forKey:k_edit_scale_key]; [d setDouble:_opacity forKey:k_edit_opacity_key];
++            [d setObject:@(customText) forKey:k_edit_custom_key]; [d setObject:@(macroText) forKey:k_edit_macros_key];
 +            [d setObject:edit_env_stamp() forKey:k_edit_stamp_key];
-+            LOG("front end: touch layout saved (size %.0f%%, opacity %.0f%%, %d moved)", _opts.scale * 100, _opacity * 100, dm_pad_layout_count(&_arrangement));
++            _hasCustomEdits = dm_pad_custom_count(&_custom) > 0 || fabs((_opts.scale > 0 ? _opts.scale : 1) - 1) > 0.001;
++            _opts.custom = _hasCustomEdits ? &_custom : NULL;
++            LOG("front end: touch layout saved (size %.0f%%, opacity %.0f%%, %d custom, %d macros)",
++                _opts.scale * 100, _opacity * 100, dm_pad_custom_count(&_custom), dm_pad_macros_count(&_macros));
 +        } else save = NO;
 +    }
-+    if (!save) { _arrangement = _editStart; _opts.scale = _editStartScale; [self editSetOpacity:_editStartOpacity]; LOG("front end: touch layout editor closed without saving"); }
-+    _editing = NO; _editTouch = nil; _editSel = -1;
++    if (!save) {
++        _arrangement = _editStart; _custom = _editStartCustom; _macros = _editStartMacros;
++        _opts.scale = _editStartScale; [self editSetOpacity:_editStartOpacity];
++        _hasCustomEdits = _editStartHasCustom; _opts.custom = _hasCustomEdits ? &_custom : NULL;
++        LOG("front end: touch layout editor closed without saving");
++    }
++    _editing = NO; _editTouch = nil; _editSel = -1; _editControl = -1;
 +    [_editCard removeFromSuperview]; _editCard = nil;
 +    [_editScrim removeFromSuperlayer]; _editScrim = nil; [_editHalo removeFromSuperlayer]; _editHalo = nil;
 +    _menu.userInteractionEnabled = YES; _controls.hidden = _padOff;
-+    _geoValid = NO; [self setNeedsLayout]; [self wakeMenu];
++    _geoValid = NO; [self applyLayout]; [self setNeedsLayout]; [self wakeMenu];
 +}
 +static CGFloat edit_shape_distance(const DmPadShape *s, CGPoint p) {   // from p to the shape's outline, 0 inside it
 +    if (s->isRect) return hypot(p.x - fmax(CGRectGetMinX(s->rect), fmin(p.x, CGRectGetMaxX(s->rect))), p.y - fmax(CGRectGetMinY(s->rect), fmin(p.y, CGRectGetMaxY(s->rect))));
 +    return fmax(0, hypot(p.x - s->c.x, p.y - s->c.y) - s->r);
++}
++static CGFloat edit_shape_norm(const DmPadShape *s, CGPoint p) {   // normalized distance from shape centre (0 at centre, 1 at edge) for overlap disambiguation
++    if (s->isRect) {
++        CGFloat hw = fmax(s->rect.size.width / 2, 1), hh = fmax(s->rect.size.height / 2, 1);
++        return hypot((p.x - CGRectGetMidX(s->rect)) / hw, (p.y - CGRectGetMidY(s->rect)) / hh);
++    }
++    return hypot(p.x - s->c.x, p.y - s->c.y) / fmax(s->r, 1);
 +}
 +- (BOOL)editMovable:(int)c {   // the diamond as one control, or its four keys on their own
 +    BOOL key = c >= DM_PAD_C_A && c <= DM_PAD_C_Y;
 +    if (!dm_pad_control_drawn(c, _full)) return NO;
 +    return c == DM_PAD_C_FACE ? !_editApart : key ? _editApart : YES;
 +}
-+- (int)editControlAt:(CGPoint)p {   // the control nearest to p, within 16 points of its outline
-+    DmPadShape s[20]; int n = dm_pad_shapes(self.geo, _full, s), best = -1; CGFloat bd = 16;
++- (int)editControlAt:(CGPoint)p {   // control or custom macro under p; overlapping scaled buttons disambiguate by normalized centre distance
++    const DmPadGeo *g = self.geo;
++    int set = [self editSet];
++    int bestInside = -1; CGFloat bestNorm = CGFLOAT_MAX;
++    int bestNear = -1; CGFloat bestDist = 16;
++    for (int i = 0; i < DM_PAD_MACRO_MAX; i++) {
++        const DmPadMacro *m = &_macros.items[set][i];
++        if (!m->active || !(m->mask & 0xFFFFu)) continue;
++        CGFloat r = 0; CGPoint mc = dm_pad_macro_center(g, _layout.separated, _layout.controls, m, &r);
++        CGFloat d = hypot(p.x - mc.x, p.y - mc.y);
++        if (d <= r) {
++            CGFloat norm = d / fmax(r, 1);
++            if (norm < bestNorm) { bestNorm = norm; bestInside = DM_PAD_C_N + i; }
++        } else if (d - r < bestDist) {
++            bestDist = d - r; bestNear = DM_PAD_C_N + i;
++        }
++    }
++    DmPadShape s[20]; int n = dm_pad_shapes(g, _full, s);
 +    for (int c = 0; c < DM_PAD_C_N; c++) {
 +        if (![self editMovable:c]) continue;
-+        for (int i = 0; i < n; i++) if (dm_pad_is_shape_of(s[i].id, c)) { CGFloat d = edit_shape_distance(&s[i], p); if (d < bd) { bd = d; best = c; } }
++        for (int i = 0; i < n; i++) if (dm_pad_is_shape_of(s[i].id, c)) {
++            CGFloat d = edit_shape_distance(&s[i], p);
++            if (d <= 0) {
++                CGFloat norm = edit_shape_norm(&s[i], p);
++                if (norm < bestNorm) { bestNorm = norm; bestInside = c; }
++            } else if (d < bestDist) {
++                bestDist = d; bestNear = c;
++            }
++        }
 +    }
-+    return best;
++    return bestInside >= 0 ? bestInside : bestNear;
 +}
 +- (CGRect)editBox:(int)c {
++    if (c >= DM_PAD_C_N) {
++        int set = [self editSet], idx = c - DM_PAD_C_N;
++        if (idx < 0 || idx >= DM_PAD_MACRO_MAX || !_macros.items[set][idx].active) return CGRectNull;
++        CGFloat r = 0; CGPoint mc = dm_pad_macro_center(self.geo, _layout.separated, _layout.controls, &_macros.items[set][idx], &r);
++        return CGRectMake(mc.x - r, mc.y - r, 2 * r, 2 * r);
++    }
 +    DmPadShape s[20]; int n = dm_pad_shapes(self.geo, _full, s); CGRect box = CGRectNull;
 +    for (int i = 0; i < n; i++) if (dm_pad_is_shape_of(s[i].id, c)) box = CGRectUnion(box, dm_pad_shape_box(&s[i]));
 +    return box;
 +}
 +- (void)editBegan:(NSSet<UITouch *> *)ts {
-+    if (_editTouch) return;
++    if (_editTouch || _macroCard) return;
 +    UITouch *t = ts.anyObject; CGPoint p = [t locationInView:self];
 +    int c = [self editControlAt:p];
-+    if (c < 0) { if (_editSel >= 0) { _editSel = -1; [self setNeedsLayout]; } return; }
++    if (c < 0) {
++        if (_editSel >= 0) [self editSelectControl:-1];
++        return;
++    }
 +    int set = [self editSet];
-+    DmPadLayout none = _arrangement; none.dx[set][c] = 0; none.dy[set][c] = 0;   // where the control sits with no move of its own: the drag is measured from there
-+    DmPadOptions o = _opts; o.layout = &none;
-+    DmPadGeo base = dm_pad_geo(self.bounds, self.safeAreaInsets, _layout, _full, o);
-+    _editBase = dm_pad_control_ref(&base, c); _editStartPos = dm_pad_control_ref(self.geo, c);
++    if (c >= DM_PAD_C_N) {
++        int idx = c - DM_PAD_C_N;
++        CGFloat r = 0;
++        _editStartPos = dm_pad_macro_center(self.geo, _layout.separated, _layout.controls, &_macros.items[set][idx], &r);
++        _editBase = _editStartPos;
++    } else {
++        DmPadCustom none = _custom;
++        none.hasPos[set][c] = NO; none.dx[set][c] = 0; none.dy[set][c] = 0;
++        DmPadOptions o = _opts; o.custom = &none;
++        DmPadGeo base = dm_pad_geo(self.bounds, self.safeAreaInsets, _layout, _full, o);
++        _editBase = dm_pad_control_ref(&base, c);
++        _editStartPos = dm_pad_control_ref(self.geo, c);
++    }
 +    _editTouch = t; _editControl = c; _editGrab = p; _editSel = c;
++    [self editSyncCard];
 +    [self setNeedsLayout];
 +}
 +- (void)editMoved:(NSSet<UITouch *> *)ts {
 +    if (!_editTouch || ![ts containsObject:_editTouch]) return;
 +    int c = _editControl, set = [self editSet];
-+    CGFloat step = self.geo->faceR / 2; if (step <= 0) return;
 +    CGPoint p = [_editTouch locationInView:self];
-+    int wx = (int)lround((_editStartPos.x + p.x - _editGrab.x - _editBase.x) / step), wy = (int)lround((_editStartPos.y + p.y - _editGrab.y - _editBase.y) / step);
-+    wx = MAX(-DM_PAD_STEP_MAX, MIN(DM_PAD_STEP_MAX, wx)); wy = MAX(-DM_PAD_STEP_MAX, MIN(DM_PAD_STEP_MAX, wy));
-+    signed char ox = _arrangement.dx[set][c], oy = _arrangement.dy[set][c];
-+    if (wx == ox && wy == oy) return;
-+    const int tries[3][2] = {{wx, wy}, {wx, oy}, {ox, wy}};   // where the finger is, then sliding along what blocks it on either axis
-+    for (int i = 0; i < 3; i++) {
-+        _arrangement.dx[set][c] = (signed char)tries[i][0]; _arrangement.dy[set][c] = (signed char)tries[i][1]; _geoValid = NO;
-+        if (!(self.geo->dropped & (1u << c))) { [self setNeedsLayout]; return; }
++    if (c >= DM_PAD_C_N) {
++        int idx = c - DM_PAD_C_N;
++        if (idx < 0 || idx >= DM_PAD_MACRO_MAX || !_macros.items[set][idx].active) return;
++        CGRect area = _layout.separated ? _layout.controls : self.bounds;
++        if (area.size.width <= 0 || area.size.height <= 0) return;
++        CGFloat r = 0; dm_pad_macro_center(self.geo, _layout.separated, _layout.controls, &_macros.items[set][idx], &r);
++        CGPoint target = CGPointMake(_editStartPos.x + (p.x - _editGrab.x), _editStartPos.y + (p.y - _editGrab.y));
++        CGFloat minX = CGRectGetMinX(area) + r, maxX = CGRectGetMaxX(area) - r;
++        CGFloat minY = CGRectGetMinY(area) + r, maxY = CGRectGetMaxY(area) - r;
++        CGFloat cx = minX <= maxX ? fmax(minX, fmin(target.x, maxX)) : CGRectGetMidX(area);
++        CGFloat cy = minY <= maxY ? fmax(minY, fmin(target.y, maxY)) : CGRectGetMidY(area);
++        if (fabs(cx - target.x) > 0.5 || fabs(cy - target.y) > 0.5) { _editStartPos = CGPointMake(cx, cy); _editGrab = p; }
++        _macros.items[set][idx].nx = (cx - CGRectGetMinX(area)) / area.size.width;
++        _macros.items[set][idx].ny = (cy - CGRectGetMinY(area)) / area.size.height;
++        [self setNeedsLayout];
++        return;
 +    }
-+    _arrangement.dx[set][c] = ox; _arrangement.dy[set][c] = oy; _geoValid = NO;   // no room anywhere on the way: it stays where it was
++    CGFloat u0 = self.geo->baseU > 0 ? self.geo->baseU : 1;
++    CGPoint target = CGPointMake(_editStartPos.x + (p.x - _editGrab.x), _editStartPos.y + (p.y - _editGrab.y));
++    _custom.hasPos[set][c] = YES;
++    _custom.dx[set][c] = (target.x - _editBase.x) / u0;
++    _custom.dy[set][c] = (target.y - _editBase.y) / u0;
++    _geoValid = NO;
++    CGPoint actual = dm_pad_control_ref(self.geo, c);
++    _custom.dx[set][c] = (actual.x - _editBase.x) / u0;
++    _custom.dy[set][c] = (actual.y - _editBase.y) / u0;
++    if (fabs(actual.x - target.x) > 0.5 || fabs(actual.y - target.y) > 0.5) { _editStartPos = actual; _editGrab = p; }
++    [self setNeedsLayout];
 +}
 +- (void)editEnded:(NSSet<UITouch *> *)ts { if (_editTouch && [ts containsObject:_editTouch]) { _editTouch = nil; _editControl = -1; } }
 +- (void)editLayout {   // after every layout: the dim, the outline of the selected control, the card
@@ -394,26 +1333,74 @@ index 9860743..ee6ebb4 100644
 +    _editHalo.hidden = CGRectIsNull(box);
 +    if (!CGRectIsNull(box)) {
 +        CGRect r = CGRectInset(box, -7, -7);
-+        CGPathRef path = CGPathCreateWithRoundedRect(r, fmin(14, fmin(r.size.width, r.size.height) / 2), fmin(14, fmin(r.size.width, r.size.height) / 2), NULL);
++        CGFloat rad = _editSel >= DM_PAD_C_N ? fmin(r.size.width, r.size.height) / 2 : fmin(14, fmin(r.size.width, r.size.height) / 2);
++        CGPathRef path = CGPathCreateWithRoundedRect(r, rad, rad, NULL);
 +        _editHalo.path = path; CGPathRelease(path);
 +    }
 +    [CATransaction commit];
 +    [self editPlaceCard];
++    if (_macroCard) [self editPlaceMacroCard:_macroCardLifted];
 +}
 +- (void)editPlaceCard {   // inside the safe area; centred the first time
 +    if (!_editCard) return;
 +    CGRect area = UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets); area = CGRectInset(area, 8, 8);
-+    CGSize size = [_editCard fittedSizeForWidth:fmin(380, area.size.width)];
++    CGSize size = [_editCard fittedSizeForWidth:fmin(392, area.size.width)];
 +    CGPoint centre = _editCardPlaced ? _editCard.center : CGPointMake(CGRectGetMidX(area), CGRectGetMidY(area));
 +    centre.x = fmax(CGRectGetMinX(area) + size.width / 2, fmin(centre.x, CGRectGetMaxX(area) - size.width / 2));
 +    centre.y = fmax(CGRectGetMinY(area) + size.height / 2, fmin(centre.y, CGRectGetMaxY(area) - size.height / 2));
 +    _editCard.bounds = CGRectMake(0, 0, size.width, size.height); _editCard.center = centre; _editCardPlaced = YES;
 +}
++- (void)editPlaceMacroCard:(BOOL)lifted {
++    _macroCardLifted = lifted;
++    if (!_macroCard) return;
++    CGRect area = UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets); area = CGRectInset(area, 8, 8);
++    CGSize size = [_macroCard fittedSizeForWidth:fmin(368, area.size.width) maxHeight:fmax(160, area.size.height)];
++    CGFloat cy = lifted ? CGRectGetMinY(area) + size.height / 2 + 4 : CGRectGetMidY(area);
++    cy = fmax(CGRectGetMinY(area) + size.height / 2, fmin(cy, CGRectGetMaxY(area) - size.height / 2));
++    _macroCard.bounds = CGRectMake(0, 0, size.width, size.height);
++    _macroCard.center = CGPointMake(CGRectGetMidX(area), cy);
++}
 +
  // ---- The right-stick hint ----
  // The 3D layout's right stick is not drawn (it answers anywhere in the right third), and players read the layout as having none (GitHub issues #347, #414).
  // So the first time the 3D layout shows in a launch, a few words say where it is, for two seconds, then fade. Words only: a ring or a knob would read as
-@@ -833,7 +1106,7 @@ static BOOL pads_slotted(GCController *gone) {
+@@ -569,7 +1620,7 @@ static BOOL g_hintShown;   // once per launch
+ - (void)placeHint {
+     if (g_hintShown && _hint.hidden) return;
+     if (!_full || _tap || _padOff || !_hintWords.length || CGRectIsEmpty(self.bounds)) { if (!_hint.hidden) [self hideHint]; return; }
+-    CGFloat u = self.u, fs = fmin(fmax(15 * u, 13), 20);
++    CGFloat u = self.geo->baseU > 0 ? self.geo->baseU : self.u, fs = fmin(fmax(15 * u, 13), 20);
+     UIFont *font = [UIFont systemFontOfSize:fs weight:UIFontWeightSemibold];
+     CGSize t = [_hintWords sizeWithAttributes:@{NSFontAttributeName: font}];
+     CGSize box = CGSizeMake(ceil(t.width) + 2 * fs, ceil(t.height) + fs * 0.8);
+@@ -598,10 +1649,25 @@ static BOOL g_hintShown;   // once per launch
+ }
+ - (void)safeAreaInsetsDidChange { [super safeAreaInsetsDidChange]; [self setNeedsLayout]; }
+ - (void)refresh {   // pressed state → fill, sticks → knob position
+-    uint64_t all = _faceBits | _dpadBits | _btnBits;
++    uint64_t all = _faceBits | _dpadBits | _btnBits | _macroBits;
+     [CATransaction begin]; [CATransaction setDisableActions:YES];
+     for (int b = 0; b < B_N; b++) { BOOL on = (all >> b) & 1;
+         _key[b].fillColor = (on ? k_on : k_idle).CGColor; _label[b].foregroundColor = (on ? k_textOn : k_text).CGColor; }
++    int set = [self editSet];
++    for (int i = 0; i < DM_PAD_MACRO_MAX; i++) {
++        const DmPadMacro *m = &_macros.items[set][i];
++        if (_tap || !m->active || !(m->mask & 0xFFFFu)) continue;
++        int mode = m->mode;
++        BOOL held = ((_macroHeldMask >> i) & 1u) != 0;
++        BOOL latched = mode == DM_PAD_MACRO_TOGGLE && ((_macroLatchedMask >> i) & 1u) != 0;
++        BOOL lit = mode == DM_PAD_MACRO_TOGGLE ? (held || latched) : mode == DM_PAD_MACRO_TURBO ? (held && _turboPhase) : held;
++        UIColor *fill = mode == DM_PAD_MACRO_TOGGLE ? (lit ? k_toggleOn : k_toggleIdle) : mode == DM_PAD_MACRO_TURBO ? (lit ? k_turboOn : k_turboIdle) : (lit ? k_macroOn : k_macroIdle);
++        UIColor *stroke = mode == DM_PAD_MACRO_TOGGLE ? k_toggleLine : mode == DM_PAD_MACRO_TURBO ? k_turboLine : k_macroLine;
++        _macroLayer[i].fillColor = fill.CGColor;
++        _macroLayer[i].strokeColor = stroke.CGColor;
++        _macroLabel[i].foregroundColor = (lit ? k_textOn : UIColor.whiteColor).CGColor;
++        _macroBadge[i].foregroundColor = (lit ? k_textOn : stroke).CGColor;
++    }
+     CGPoint h = self.stickHome, o = [self knobOffset:0];
+     _knob.position = CGPointMake(h.x + o.x, h.y + o.y); _knob.fillColor = (_stick[0] ? k_on : k_idle).CGColor;
+     [CATransaction commit];
+@@ -833,7 +1899,7 @@ static BOOL pads_slotted(GCController *gone) {
      if (_padOff && !_layout.onTV) [self wakeMenu];
  }
  - (void)updateControlVisibility {
@@ -422,7 +1409,7 @@ index 9860743..ee6ebb4 100644
      if (_padOff && _layout.onTV) {
          ++_menuGen; [_menu.layer removeAllAnimations];
          _menu.alpha = 1; _menu.hidden = YES;
-@@ -961,6 +1234,8 @@ void dm_gamepad_touch_feedback(bool on) { [g_view setTouchFeedback:on]; }
+@@ -961,6 +2027,8 @@ void dm_gamepad_touch_feedback(bool on) { [g_view setTouchFeedback:on]; }
  int dm_pad_layout(void) { return g_view ? [g_view padLayout] : 0; }
  bool dm_pad_layout_offered(int layout) { return layout == 0 || layout == 1 || (layout == 2 && dm_opmode() == 0); }
  void dm_pad_layout_set(int layout) { [g_view setPadLayout:layout]; }
@@ -431,19 +1418,152 @@ index 9860743..ee6ebb4 100644
  void dm_gamepad_pads_read(void) {   // front_ios.m: the quit prompt closed, the game reads every controller as it is now (a button held through it counts again)
      if (g_merge) { for (GCController *c in GCController.controllers) if (c.extendedGamepad) read_pad(c.extendedGamepad); }
      else for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p].extendedGamepad) read_pad(g_held[p].extendedGamepad);
+@@ -981,13 +2049,17 @@ void dm_gamepad_teardown(void) {
+         if (@available(iOS 27.0, *)) g_motion.deviceMotionBody = nil;
+         g_motion = nil;
+     }
+-    if (g_view) {
+-        [NSNotificationCenter.defaultCenter removeObserver:g_view];
+-        [g_view reset];
++    DmGamepad *view = g_view;
++    if (view) {
++        [NSNotificationCenter.defaultCenter removeObserver:view];
+         g_view = nil;
+     }
+-    if ([NSThread isMainThread]) cp_teardown();
+-    else dispatch_sync(dispatch_get_main_queue(), ^{ cp_teardown(); });
++    void (^teardownUI)(void) = ^{
++        if (view) { [view finishEditingLayout:NO]; [view reset]; }
++        cp_teardown();
++    };
++    if ([NSThread isMainThread]) teardownUI();
++    else dispatch_sync(dispatch_get_main_queue(), teardownUI);
+     for (GCController *c in GCController.controllers) {
+         c.extendedGamepad.valueChangedHandler = nil;
+         c.extendedGamepad.buttonHome.pressedChangedHandler = nil;
+@@ -998,4 +2070,7 @@ void dm_gamepad_teardown(void) {
+         g_held[p] = nil;
+     }
+     k_idle = nil; k_on = nil; k_line = nil; k_ringFill = nil; k_text = nil; k_textOn = nil;
++    k_macroIdle = nil; k_macroOn = nil; k_macroLine = nil;
++    k_toggleIdle = nil; k_toggleOn = nil; k_toggleLine = nil;
++    k_turboIdle = nil; k_turboOn = nil; k_turboLine = nil;
+ }
 diff --git a/dm/ios/Sources/DmPadGeometry.h b/dm/ios/Sources/DmPadGeometry.h
-index d2efd77..27e4cc8 100644
+index d2efd77..bdff7d5 100644
 --- a/dm/ios/Sources/DmPadGeometry.h
 +++ b/dm/ios/Sources/DmPadGeometry.h
-@@ -9,6 +9,7 @@
+@@ -9,6 +9,8 @@
  #pragma once
  #import "DmLayout.h"
  #include <math.h>
++#include <stdint.h>
 +#include <stdio.h>
  #include <string.h>
  
  NS_ASSUME_NONNULL_BEGIN
-@@ -277,6 +278,42 @@ static inline int dm_pad_layout_count(const DmPadLayout *l) {   // the moved con
+@@ -29,25 +31,59 @@ enum { DM_PAD_SET_2D = 0, DM_PAD_SET_3D, DM_PAD_SET_2D_SPLIT, DM_PAD_SET_3D_SPLI
+ // controls and not with the screen. 0 0 is the built-in place.
+ typedef struct { signed char dx[DM_PAD_SET_N][DM_PAD_C_N], dy[DM_PAD_SET_N][DM_PAD_C_N]; } DmPadLayout;
+ 
++// In-game layout editor: per-control relative size scale (0.4..4.0 effective, i.e. 40%..400%) and fine position offsets in base u0 units.
++// Kept separate from DmPadLayout so DM_TOUCH_LAYOUT stays unchanged for the shell.
++static const CGFloat DM_PAD_SCALE_MIN = 0.4, DM_PAD_SCALE_MAX = 4.0;
++static const CGFloat DM_PAD_REL_SCALE_MIN = 0.1, DM_PAD_REL_SCALE_MAX = 10.0;
++enum { DM_PAD_CUSTOM_MAX = 4096, DM_PAD_MACRO_MAX = 12, DM_PAD_MACRO_LABEL_MAX = 20, DM_PAD_MACROS_STR_MAX = 4096 };
++enum { DM_PAD_MACRO_HOLD = 0, DM_PAD_MACRO_TOGGLE = 1, DM_PAD_MACRO_TURBO = 2 };
++
++typedef struct {
++    CGFloat scale[DM_PAD_SET_N][DM_PAD_C_N];   // <=0 means 1.0 (inherit global scale); otherwise relative multiplier
++    CGFloat dx[DM_PAD_SET_N][DM_PAD_C_N];      // fine horizontal offset in base u0 units
++    CGFloat dy[DM_PAD_SET_N][DM_PAD_C_N];      // fine vertical offset in base u0 units
++    BOOL hasPos[DM_PAD_SET_N][DM_PAD_C_N];     // whether dx/dy was placed by free dragging in the editor
++} DmPadCustom;
++
++// A custom macro button that fires any combination of Switch buttons (mask: bits 0..15 = DM_BTN_A..DM_BTN_DOWN) with a single touch.
++typedef struct {
++    BOOL active;
++    uint64_t mask;
++    CGFloat nx, ny;   // normalized centre inside the controls area (0..1)
++    CGFloat scale;    // 0.4..4.0 (1.0 = built-in face key radius 27 * u0)
++    int mode;         // DM_PAD_MACRO_HOLD, DM_PAD_MACRO_TOGGLE, DM_PAD_MACRO_TURBO
++    char label[DM_PAD_MACRO_LABEL_MAX + 1];
++} DmPadMacro;
++
++typedef struct {
++    DmPadMacro items[DM_PAD_SET_N][DM_PAD_MACRO_MAX];
++} DmPadMacros;
++
+ typedef struct {
+-    CGFloat scale;   // DM_TOUCH_SIZE: 0.8 small, 1 medium (the built-in size), 1.2 large
++    CGFloat scale;   // DM_TOUCH_SIZE: 0.8 small, 1 medium (the built-in size), 1.2 large; or editor global scale 0.4..4.0
+     int stick;       // DM_TOUCH_STICK: where the left stick sits (the D-pad moves with it when it moves inward); the right-hand controls keep their place
+     const DmPadLayout *_Nullable layout;   // DM_TOUCH_LAYOUT: the player's arrangement, NULL for none
++    const DmPadCustom *_Nullable custom;   // in-game editor per-control scales & fine offsets, NULL when unused
+ } DmPadOptions;
+ 
+ typedef struct {
+     CGFloat u;                            // the unit every size below is a multiple of
++    CGFloat baseU;                        // base screen unit u0 before global or per-control scaling
+     CGRect safe, corner, customBounds;    // built-in areas; customBounds, when set after placement, is only for manual moves
+     BOOL portrait;                        // separated and taller than wide: both thumbs' clusters sit in the controls region's middle band
+     CGPoint face; CGFloat faceGap, faceR, faceHitR;   // the A B X Y diamond: centre, key distance from it, key radius, hit radius
+     CGPoint stick; CGFloat stickR, knobR;             // the left stick: ring centre and radius, knob radius
+     CGPoint dpad; CGFloat dpadR, armW, armIn;         // the D-pad (3D only): centre, arm outer edge, arm half-width, arm tip from the centre
+     CGPoint drop[4]; CGFloat dropR[4];                // ZL, L, ZR, R: teardrop centres and radii
+-    CGPoint click[2]; CGFloat clickR;                 // L3, R3 (3D only)
++    CGPoint click[2]; CGFloat clickR;                 // L3, R3 (3D only; clickR equals clickKeyR[0] for compatibility)
+     CGRect pill[2];                                   // −, +
+     CGPoint swap; CGFloat swapR;                      // the menu button
+     CGPoint faceKey[4];                               // A B X Y where they are: the diamond around face, unless a key was moved on its own
+-    BOOL faceSplit;                                   // a key of the diamond was moved on its own: the diamond is then grabbed key by key
++    CGFloat faceKeyR[4], faceKeyHitR[4];              // per-key radius & hit radius for A, B, X, Y
++    CGFloat clickKeyR[2];                             // per-key radius for L3, R3
++    CGFloat controlScale[DM_PAD_C_N];                 // effective scale (0.4..4.0) of each control
++    BOOL faceSplit;                                   // a key of the diamond was moved or resized on its own: the diamond is then grabbed key by key
++    BOOL customActive;                                // in-game editor custom scaling or free positioning is active
+     unsigned moved, dropped;                          // DM_TOUCH_LAYOUT: the controls (1 << DM_PAD_C_*) it moved, and the ones it asked to move that kept their place
+ } DmPadGeo;
+ 
+@@ -126,7 +162,10 @@ static inline DmPadGeo dm_pad_geo_at(CGRect bounds, UIEdgeInsets insets, DmLayou
+         g.pill[i] = CGRectMake(x - w / 2, top - h / 2, w, h);
+     }
+     g.swap = CGPointMake(CGRectGetMidX(s), top); g.swapR = DM_PAD_SWAP_R * u;
+-    for (int i = 0; i < 4; i++) g.faceKey[i] = dm_pad_diamond_key(g.face, g.faceGap, i);
++    g.baseU = u;
++    for (int i = 0; i < 4; i++) { g.faceKey[i] = dm_pad_diamond_key(g.face, g.faceGap, i); g.faceKeyR[i] = g.faceR; g.faceKeyHitR[i] = g.faceHitR; }
++    for (int i = 0; i < 2; i++) g.clickKeyR[i] = g.clickR;
++    for (int c = 0; c < DM_PAD_C_N; c++) g.controlScale[c] = 1;
+     return g;
+ }
+ 
+@@ -144,14 +183,14 @@ static inline int dm_pad_shapes(const DmPadGeo *g, BOOL full, DmPadShape out[_No
+     int n = 0;
+     CGRect safe = CGRectIsNull(g->customBounds) ? g->safe : g->customBounds;
+     CGRect corner = CGRectIsNull(g->customBounds) ? g->corner : g->customBounds;
+-    for (int i = 0; i < 4; i++) out[n++] = (DmPadShape){dm_pad_face_key(g, i), g->faceR, CGRectNull, NO, corner, DM_PAD_SHAPE_FACE + i};
++    for (int i = 0; i < 4; i++) out[n++] = (DmPadShape){dm_pad_face_key(g, i), g->faceKeyR[i] > 0 ? g->faceKeyR[i] : g->faceR, CGRectNull, NO, corner, DM_PAD_SHAPE_FACE + i};
+     out[n++] = (DmPadShape){g->stick, g->stickR, CGRectNull, NO, corner, DM_PAD_SHAPE_STICK};
+     if (full) out[n++] = (DmPadShape){g->dpad, hypot(g->dpadR, g->armW), CGRectNull, NO, corner, DM_PAD_SHAPE_DPAD};
+     for (int i = 0; i < 4; i++) {
+         out[n++] = (DmPadShape){g->drop[i], g->dropR[i], CGRectNull, NO, safe, DM_PAD_SHAPE_DROP + i};
+         out[n++] = (DmPadShape){dm_pad_drop_tip(g, i), 0, CGRectNull, NO, safe, DM_PAD_SHAPE_TIP + i};
+     }
+-    if (full) for (int i = 0; i < 2; i++) out[n++] = (DmPadShape){g->click[i], g->clickR, CGRectNull, NO, safe, DM_PAD_SHAPE_CLICK + i};
++    if (full) for (int i = 0; i < 2; i++) out[n++] = (DmPadShape){g->click[i], g->clickKeyR[i] > 0 ? g->clickKeyR[i] : g->clickR, CGRectNull, NO, safe, DM_PAD_SHAPE_CLICK + i};
+     for (int i = 0; i < 2; i++) out[n++] = (DmPadShape){CGPointZero, 0, g->pill[i], YES, safe, DM_PAD_SHAPE_PILL + i};
+     out[n++] = (DmPadShape){g->swap, g->swapR, CGRectNull, NO, safe, DM_PAD_SHAPE_SWAP};
+     return n;
+@@ -203,6 +242,8 @@ static inline DmPadGeo dm_pad_geo_placed(CGRect bounds, UIEdgeInsets insets, DmL
+         scale = scale > 1 ? fmax(1, scale - 0.05) : fmin(1, scale + 0.05);
+         g = dm_pad_geo_at(bounds, insets, layout, full, u0 * scale);
+     }
++    g.baseU = u0;
++    for (int c = 0; c < DM_PAD_C_N; c++) g.controlScale[c] = scale;
+     // The left stick's place: higher lifts it toward the shoulders, inward moves it (and the D-pad, which sits inward of it) toward the
+     // middle. The move shrinks in steps until nothing overlaps; on a screen with no room the stick stays in the corner.
+     if (o.stick != DM_PAD_STICK_CORNER) {
+@@ -277,6 +318,42 @@ static inline int dm_pad_layout_count(const DmPadLayout *l) {   // the moved con
      return n;
  }
  
@@ -486,8 +1606,476 @@ index d2efd77..27e4cc8 100644
  // The drawn shapes (dm_pad_shapes ids) of a control.
  static inline BOOL dm_pad_is_shape_of(int id, int c) {
      switch (c) {
+@@ -369,8 +446,371 @@ static inline void dm_pad_arrange(DmPadGeo *g, BOOL full, BOOL separated, const
+     }
+ }
+ 
+-// The geometry the gamepad draws, hit-tests and grabs with: the size and the stick's place (dm_pad_geo_placed), then the player's arrangement.
++// ---- Per-control custom scales (up to 400%), fine offsets and custom macro buttons ----
++static inline CGFloat dm_pad_clamp_scale(CGFloat s) { return fmax(DM_PAD_SCALE_MIN, fmin(DM_PAD_SCALE_MAX, s)); }
++static inline CGFloat dm_pad_effective_scale(CGFloat globalScale, const DmPadCustom *_Nullable custom, int set, int c) {
++    CGFloat g = globalScale > 0 ? globalScale : 1;
++    CGFloat r = (custom && set >= 0 && set < DM_PAD_SET_N && c >= 0 && c < DM_PAD_C_N && custom->scale[set][c] > 0) ? custom->scale[set][c] : 1;
++    if (c >= DM_PAD_C_A && c <= DM_PAD_C_Y) {
++        CGFloat fr = (custom && set >= 0 && set < DM_PAD_SET_N && custom->scale[set][DM_PAD_C_FACE] > 0) ? custom->scale[set][DM_PAD_C_FACE] : 1;
++        r *= fr;
++    }
++    return dm_pad_clamp_scale(g * r);
++}
++static inline BOOL dm_pad_custom_any_in_set(const DmPadCustom *_Nullable custom, int set) {
++    if (!custom || set < 0 || set >= DM_PAD_SET_N) return NO;
++    for (int c = 0; c < DM_PAD_C_N; c++) {
++        if (custom->hasPos[set][c]) return YES;
++        if (custom->scale[set][c] > 0 && fabs(custom->scale[set][c] - 1) > 0.001) return YES;
++    }
++    return NO;
++}
++static inline BOOL dm_pad_custom_face_split_in_set(const DmPadCustom *_Nullable custom, int set) {
++    if (!custom || set < 0 || set >= DM_PAD_SET_N) return NO;
++    for (int c = DM_PAD_C_A; c <= DM_PAD_C_Y; c++) {
++        if (custom->hasPos[set][c]) return YES;
++        if (custom->scale[set][c] > 0 && fabs(custom->scale[set][c] - 1) > 0.001) return YES;
++    }
++    return NO;
++}
++static inline int dm_pad_custom_count(const DmPadCustom *_Nullable custom) {
++    if (!custom) return 0;
++    int n = 0;
++    for (int s = 0; s < DM_PAD_SET_N; s++)
++        for (int c = 0; c < DM_PAD_C_N; c++)
++            if (custom->hasPos[s][c] || (custom->scale[s][c] > 0 && fabs(custom->scale[s][c] - 1) > 0.001)) n++;
++    return n;
++}
++static inline BOOL dm_pad_parse_int(const char *_Nonnull *_Nonnull pp, int lo, int hi, int *out) {
++    const char *p = *pp; int sign = 1, v = 0, digits = 0;
++    if (*p == '-') { sign = -1; p++; }
++    while (*p >= '0' && *p <= '9') {
++        if (++digits > 7) return NO;
++        v = v * 10 + (*p++ - '0');
++    }
++    if (!digits) return NO;
++    v *= sign;
++    if (v < lo || v > hi) return NO;
++    *out = v; *pp = p;
++    return YES;
++}
++static inline int dm_pad_hex_digit(char ch) {
++    if (ch >= '0' && ch <= '9') return ch - '0';
++    if (ch >= 'a' && ch <= 'f') return 10 + (ch - 'a');
++    if (ch >= 'A' && ch <= 'F') return 10 + (ch - 'A');
++    return -1;
++}
++static inline BOOL dm_pad_parse_hex16(const char *_Nonnull *_Nonnull pp, uint64_t *out) {
++    const char *p = *pp; uint64_t v = 0; int digits = 0;
++    while (digits < 5) {
++        int d = dm_pad_hex_digit(*p);
++        if (d < 0) break;
++        v = (v << 4) | (uint64_t)d; p++; digits++;
++    }
++    if (!digits || digits > 4 || v == 0 || v > 0xFFFFu) return NO;
++    *out = v; *pp = p;
++    return YES;
++}
++
++// Encodes DmPadCustom as locale-independent ASCII: "c1;<set>/<ctrl>:s<scale*1000>,p<dx*10>,<dy*10>..." (empty string when default).
++static inline int dm_pad_custom_encode(const DmPadCustom *custom, char *out, size_t cap) {
++    size_t n = 0;
++    if (cap) out[0] = 0;
++    for (int s = 0; s < DM_PAD_SET_N; s++) {
++        if (!dm_pad_custom_any_in_set(custom, s)) continue;
++        int w = snprintf(out + n, cap - n, "%s;%s", n ? "" : "c1", dm_pad_set_names[s]);
++        if (w < 0 || (size_t)w >= cap - n) { if (cap) out[0] = 0; return -1; }
++        n += (size_t)w;
++        for (int c = 0; c < DM_PAD_C_N; c++) {
++            BOOL hasS = custom->scale[s][c] > 0 && fabs(custom->scale[s][c] - 1) > 0.001;
++            BOOL hasP = custom->hasPos[s][c];
++            if (!hasS && !hasP) continue;
++            int sc = (int)lround(fmax(DM_PAD_REL_SCALE_MIN, fmin(DM_PAD_REL_SCALE_MAX, custom->scale[s][c])) * 1000.0);
++            int ix = (int)lround(fmax(-20000.0, fmin(20000.0, custom->dx[s][c] * 10.0)));
++            int iy = (int)lround(fmax(-20000.0, fmin(20000.0, custom->dy[s][c] * 10.0)));
++            if (hasS && hasP) w = snprintf(out + n, cap - n, "/%s:s%d,p%d,%d", dm_pad_control_names[c], sc, ix, iy);
++            else if (hasS) w = snprintf(out + n, cap - n, "/%s:s%d", dm_pad_control_names[c], sc);
++            else w = snprintf(out + n, cap - n, "/%s:p%d,%d", dm_pad_control_names[c], ix, iy);
++            if (w < 0 || (size_t)w >= cap - n) { if (cap) out[0] = 0; return -1; }
++            n += (size_t)w;
++        }
++    }
++    return (int)n;
++}
++static inline BOOL dm_pad_custom_parse(const char *_Nullable v, DmPadCustom *out) {
++    memset(out, 0, sizeof *out);
++    if (!v || !*v) return YES;
++    if (strnlen(v, DM_PAD_CUSTOM_MAX + 1) > DM_PAD_CUSTOM_MAX || v[0] != 'c' || v[1] != '1' || (v[2] && v[2] != ';')) return NO;
++    DmPadCustom tmp; memset(&tmp, 0, sizeof tmp);
++    const char *p = v + 2;
++    while (*p == ';') {
++        const char *name = ++p;
++        while (*p && *p != '/' && *p != ';') p++;
++        int set = dm_pad_name_index(name, (size_t)(p - name), dm_pad_set_names, DM_PAD_SET_N);
++        while (*p == '/') {
++            const char *ctrl = ++p;
++            while ((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9')) p++;
++            size_t cn = (size_t)(p - ctrl);
++            if (!cn || *p != ':') return NO;
++            p++;
++            int c = dm_pad_name_index(ctrl, cn, dm_pad_control_names, DM_PAD_C_N);
++            BOOL gotAny = NO;
++            while (*p && *p != '/' && *p != ';') {
++                if (gotAny) { if (*p != ',') return NO; p++; }
++                if (*p == 's') {
++                    p++; int sc = 0;
++                    if (!dm_pad_parse_int(&p, (int)(DM_PAD_REL_SCALE_MIN * 1000), (int)(DM_PAD_REL_SCALE_MAX * 1000), &sc)) return NO;
++                    if (set >= 0 && c >= 0) tmp.scale[set][c] = sc / 1000.0;
++                    gotAny = YES;
++                } else if (*p == 'p') {
++                    p++; int ix = 0, iy = 0;
++                    if (!dm_pad_parse_int(&p, -20000, 20000, &ix) || *p != ',') return NO;
++                    p++;
++                    if (!dm_pad_parse_int(&p, -20000, 20000, &iy)) return NO;
++                    if (set >= 0 && c >= 0) { tmp.dx[set][c] = ix / 10.0; tmp.dy[set][c] = iy / 10.0; tmp.hasPos[set][c] = YES; }
++                    gotAny = YES;
++                } else return NO;
++            }
++            if (!gotAny) return NO;
++        }
++        if (*p && *p != ';') return NO;
++    }
++    if (*p) return NO;
++    *out = tmp;
++    return YES;
++}
++
++// Button labels in DM_BTN_* bit order (0..15): A, B, X, Y, L3, R3, L, R, ZL, ZR, +, −, ←, ↑, →, ↓.
++static const char *_Nonnull const dm_pad_btn_labels[16] = {
++    "A", "B", "X", "Y", "L3", "R3", "L", "R", "ZL", "ZR", "+", "\xE2\x88\x92", "\xE2\x86\x90", "\xE2\x86\x91", "\xE2\x86\x92", "\xE2\x86\x93"
++};
++// Auto-generates a compact macro label such as "X+A", "ZL+R", or "Y+B" from a button bitmask (bits 0..15).
++static inline void dm_pad_macro_default_label(uint64_t mask, char *out, size_t cap) {
++    if (!cap) return;
++    out[0] = 0;
++    static const int order[16] = {2, 3, 0, 1, 8, 6, 7, 9, 4, 5, 11, 10, 13, 15, 12, 14};   // X, Y, A, B, ZL, L, R, ZR, L3, R3, −, +, ↑, ↓, ←, →
++    size_t n = 0;
++    for (int i = 0; i < 16; i++) {
++        int b = order[i];
++        if (!((mask >> b) & 1ull)) continue;
++        const char *lbl = dm_pad_btn_labels[b];
++        size_t need = strlen(lbl) + (n ? 1 : 0);
++        if (n + need >= cap) break;
++        if (n) out[n++] = '+';
++        memcpy(out + n, lbl, strlen(lbl));
++        n += strlen(lbl);
++        out[n] = 0;
++    }
++}
++static inline int dm_pad_macros_count_in_set(const DmPadMacros *_Nullable macros, int set) {
++    if (!macros || set < 0 || set >= DM_PAD_SET_N) return 0;
++    int n = 0;
++    for (int i = 0; i < DM_PAD_MACRO_MAX; i++) if (macros->items[set][i].active && (macros->items[set][i].mask & 0xFFFFu)) n++;
++    return n;
++}
++static inline int dm_pad_macros_count(const DmPadMacros *_Nullable macros) {
++    int n = 0;
++    for (int s = 0; s < DM_PAD_SET_N; s++) n += dm_pad_macros_count_in_set(macros, s);
++    return n;
++}
++static inline int dm_pad_macros_encode(const DmPadMacros *macros, char *out, size_t cap) {
++    size_t n = 0;
++    if (cap) out[0] = 0;
++    for (int s = 0; s < DM_PAD_SET_N; s++) {
++        if (!dm_pad_macros_count_in_set(macros, s)) continue;
++        int w = snprintf(out + n, cap - n, "%s;%s", n ? "" : "m1", dm_pad_set_names[s]);
++        if (w < 0 || (size_t)w >= cap - n) { if (cap) out[0] = 0; return -1; }
++        n += (size_t)w;
++        for (int i = 0; i < DM_PAD_MACRO_MAX; i++) {
++            const DmPadMacro *m = &macros->items[s][i];
++            if (!m->active || !(m->mask & 0xFFFFu)) continue;
++            unsigned mask = (unsigned)(m->mask & 0xFFFFu);
++            int nx = (int)lround(fmax(0, fmin(1, m->nx)) * 10000.0);
++            int ny = (int)lround(fmax(0, fmin(1, m->ny)) * 10000.0);
++            int sc = (int)lround(dm_pad_clamp_scale(m->scale > 0 ? m->scale : 1) * 1000.0);
++            int mode = (m->mode >= DM_PAD_MACRO_HOLD && m->mode <= DM_PAD_MACRO_TURBO) ? m->mode : DM_PAD_MACRO_HOLD;
++            w = snprintf(out + n, cap - n, "/%x,%d,%d,%d,%d,", mask, nx, ny, sc, mode);
++            if (w < 0 || (size_t)w >= cap - n) { if (cap) out[0] = 0; return -1; }
++            n += (size_t)w;
++            for (const unsigned char *q = (const unsigned char *)m->label; *q; q++) {
++                if (*q < 0x20 || *q == '%' || *q == ';' || *q == '/' || *q == ',') {
++                    w = snprintf(out + n, cap - n, "%%%02X", (unsigned)*q);
++                    if (w < 0 || (size_t)w >= cap - n) { if (cap) out[0] = 0; return -1; }
++                    n += (size_t)w;
++                } else {
++                    if (n + 1 >= cap) { if (cap) out[0] = 0; return -1; }
++                    out[n++] = (char)*q; out[n] = 0;
++                }
++            }
++        }
++    }
++    return (int)n;
++}
++static inline BOOL dm_pad_macros_parse(const char *_Nullable v, DmPadMacros *out) {
++    memset(out, 0, sizeof *out);
++    if (!v || !*v) return YES;
++    if (strnlen(v, DM_PAD_MACROS_STR_MAX + 1) > DM_PAD_MACROS_STR_MAX || v[0] != 'm' || v[1] != '1' || (v[2] && v[2] != ';')) return NO;
++    DmPadMacros tmp; memset(&tmp, 0, sizeof tmp);
++    int counts[DM_PAD_SET_N] = {0};
++    const char *p = v + 2;
++    while (*p == ';') {
++        const char *name = ++p;
++        while (*p && *p != '/' && *p != ';') p++;
++        int set = dm_pad_name_index(name, (size_t)(p - name), dm_pad_set_names, DM_PAD_SET_N);
++        while (*p == '/') {
++            p++;
++            uint64_t mask = 0; int nx = 0, ny = 0, sc = 1000, mode = 0;
++            if (!dm_pad_parse_hex16(&p, &mask) || *p != ',') return NO;
++            p++;
++            if (!dm_pad_parse_int(&p, 0, 10000, &nx) || *p != ',') return NO;
++            p++;
++            if (!dm_pad_parse_int(&p, 0, 10000, &ny) || *p != ',') return NO;
++            p++;
++            if (!dm_pad_parse_int(&p, (int)(DM_PAD_SCALE_MIN * 1000), (int)(DM_PAD_SCALE_MAX * 1000), &sc) || *p != ',') return NO;
++            p++;
++            if (!dm_pad_parse_int(&p, DM_PAD_MACRO_HOLD, DM_PAD_MACRO_TURBO, &mode) || *p != ',') return NO;
++            p++;
++            char lbl[DM_PAD_MACRO_LABEL_MAX + 1]; size_t ln = 0; lbl[0] = 0;
++            while (*p && *p != '/' && *p != ';') {
++                unsigned char ch;
++                if (*p == '%') {
++                    int h1 = dm_pad_hex_digit(p[1]), h2 = p[1] ? dm_pad_hex_digit(p[2]) : -1;
++                    if (h1 < 0 || h2 < 0) return NO;
++                    ch = (unsigned char)((h1 << 4) | h2); p += 3;
++                } else {
++                    ch = (unsigned char)*p++;
++                }
++                if (ln < DM_PAD_MACRO_LABEL_MAX) { lbl[ln++] = (char)ch; lbl[ln] = 0; }
++            }
++            if (!lbl[0]) dm_pad_macro_default_label(mask, lbl, sizeof lbl);
++            if (set >= 0 && counts[set] < DM_PAD_MACRO_MAX) {
++                DmPadMacro *m = &tmp.items[set][counts[set]++];
++                m->active = YES; m->mask = mask;
++                m->nx = nx / 10000.0; m->ny = ny / 10000.0;
++                m->scale = dm_pad_clamp_scale(sc / 1000.0);
++                m->mode = mode;
++                memcpy(m->label, lbl, sizeof m->label);
++            }
++        }
++        if (*p && *p != ';') return NO;
++    }
++    if (*p) return NO;
++    *out = tmp;
++    return YES;
++}
++
++// Applies per-control scaling (40%..400%) and free pixel-smooth positioning on top of the u0 base geometry.
++// Every control stays clamped inside the visible controls area; the menu button keeps its built-in u0 size.
++static inline DmPadGeo dm_pad_apply_custom(CGRect bounds, UIEdgeInsets insets, DmLayout layout, BOOL full, DmPadOptions o) {
++    int set = (layout.separated ? DM_PAD_SET_2D_SPLIT : DM_PAD_SET_2D) + (full ? 1 : 0);
++    DmPadOptions baseOpts = {1, o.stick, o.layout, NULL};
++    DmPadGeo g = dm_pad_geo_placed(bounds, insets, layout, full, baseOpts);
++    if (layout.customControlsFullBounds && bounds.size.width > bounds.size.height && !layout.separated) g.customBounds = bounds;
++    CGPoint baseFace = g.face; CGFloat baseFaceGap = g.faceGap;
++    if (o.layout) dm_pad_arrange(&g, full, layout.separated, o.layout);
++    CGRect area = layout.separated ? layout.controls : bounds;
++    if (CGRectIsEmpty(area)) return g;
++    CGFloat u0 = g.baseU > 0 ? g.baseU : 1;
++    g.u = u0; g.baseU = u0; g.customBounds = area; g.customActive = YES;
++    CGFloat maxR = fmax(20, fmin(area.size.width, area.size.height) * 0.48);
++
++    // Preserve any individual DM_TOUCH_LAYOUT delta on the face keys before resizing faceGap.
++    CGPoint keyDelta[4];
++    for (int i = 0; i < 4; i++) {
++        CGPoint bk = dm_pad_diamond_key(g.face, baseFaceGap, i);
++        keyDelta[i] = CGPointMake(g.faceKey[i].x - bk.x, g.faceKey[i].y - bk.y);
++    }
++    (void)baseFace;
++
++    for (int c = 0; c < DM_PAD_C_N; c++) g.controlScale[c] = dm_pad_effective_scale(o.scale, o.custom, set, c);
++
++    // Face diamond and individual face keys (A, B, X, Y).
++    CGFloat maxFaceKeyR = 0;
++    for (int i = 0; i < 4; i++) {
++        g.faceKeyR[i] = fmin(DM_PAD_FACE_R * u0 * g.controlScale[DM_PAD_C_A + i], maxR);
++        g.faceKeyHitR[i] = MAX(g.faceKeyR[i] * 1.25, layout.separated ? 22 : 0);
++        maxFaceKeyR = fmax(maxFaceKeyR, g.faceKeyR[i]);
++    }
++    g.faceR = g.faceKeyR[0]; g.faceHitR = g.faceKeyHitR[0];
++    CGFloat sFace = g.controlScale[DM_PAD_C_FACE];
++    CGFloat maxDiamondGap = fmax(0, fmin(area.size.width, area.size.height) * 0.5 - maxFaceKeyR);
++    g.faceGap = fmin(DM_PAD_FACE_GAP * u0 * sFace, fmax(DM_PAD_FACE_GAP * u0 * 0.5, maxDiamondGap));
++    for (int i = 0; i < 4; i++) {
++        CGPoint dk = dm_pad_diamond_key(g.face, g.faceGap, i);
++        g.faceKey[i] = CGPointMake(dk.x + keyDelta[i].x, dk.y + keyDelta[i].y);
++    }
++    if (dm_pad_custom_face_split_in_set(o.custom, set)) g.faceSplit = YES;
++
++    // Left stick.
++    g.stickR = fmin(DM_PAD_STICK_R * u0 * g.controlScale[DM_PAD_C_STICK], maxR);
++    g.knobR = g.stickR * (DM_PAD_KNOB_R / DM_PAD_STICK_R);
++
++    // D-pad.
++    CGFloat dpadOuter = hypot(DM_PAD_DPAD_R, DM_PAD_ARM_W) * u0;
++    CGFloat dpadEff = dpadOuter > 0 ? fmin(g.controlScale[DM_PAD_C_DPAD], maxR / dpadOuter) : g.controlScale[DM_PAD_C_DPAD];
++    g.dpadR = DM_PAD_DPAD_R * u0 * dpadEff;
++    g.armW = DM_PAD_ARM_W * u0 * dpadEff;
++    g.armIn = DM_PAD_ARM_IN * u0 * dpadEff;
++
++    // Shoulders (ZL, L, ZR, R).
++    for (int i = 0; i < 4; i++) {
++        CGFloat baseR = (i == DM_PAD_ZL || i == DM_PAD_ZR ? DM_PAD_ZL_R : DM_PAD_L_R) * u0;
++        g.dropR[i] = fmin(baseR * g.controlScale[DM_PAD_C_ZL + i], maxR / DM_PAD_DROP_TIP);
++    }
++
++    // L3 / R3.
++    for (int i = 0; i < 2; i++) g.clickKeyR[i] = fmin(DM_PAD_CLICK_R * u0 * g.controlScale[DM_PAD_C_L3 + i], maxR);
++    g.clickR = g.clickKeyR[0];
++
++    // Minus / Plus pills (scaled around their centres).
++    for (int i = 0; i < 2; i++) {
++        CGFloat s = g.controlScale[DM_PAD_C_MINUS + i];
++        CGFloat cx = CGRectGetMidX(g.pill[i]), cy = CGRectGetMidY(g.pill[i]);
++        CGFloat w = fmin(DM_PAD_PILL_W * u0 * s, area.size.width * 0.92);
++        CGFloat h = fmin(DM_PAD_PILL_H * u0 * s, area.size.height * 0.92);
++        g.pill[i] = CGRectMake(cx - w / 2, cy - h / 2, w, h);
++    }
++
++    // Clamp -> shift -> clamp so hasPos=YES with dx=0,dy=0 matches hasPos=NO with zero jump on drag start.
++    // When the diamond is kept together (!faceSplit), clamp it as one symmetric unit; when split, clamp each face key on its own
++    // so resizing one face button (e.g. A to 400%) never shoves B, X or Y out of place.
++    if (!g.faceSplit) {
++        CGPoint dFace = dm_pad_clamp(&g, full, DM_PAD_C_FACE);
++        dm_pad_move(&g, DM_PAD_C_FACE, dFace.x, dFace.y);
++        if (o.custom && o.custom->hasPos[set][DM_PAD_C_FACE]) {
++            dm_pad_move(&g, DM_PAD_C_FACE, o.custom->dx[set][DM_PAD_C_FACE] * u0, o.custom->dy[set][DM_PAD_C_FACE] * u0);
++            dFace = dm_pad_clamp(&g, full, DM_PAD_C_FACE);
++            dm_pad_move(&g, DM_PAD_C_FACE, dFace.x, dFace.y);
++            g.moved |= 1u << DM_PAD_C_FACE;
++        }
++    } else if (o.custom && o.custom->hasPos[set][DM_PAD_C_FACE]) {
++        dm_pad_move(&g, DM_PAD_C_FACE, o.custom->dx[set][DM_PAD_C_FACE] * u0, o.custom->dy[set][DM_PAD_C_FACE] * u0);
++        g.moved |= 1u << DM_PAD_C_FACE;
++    }
++    for (int c = 0; c < DM_PAD_C_N; c++) {
++        if (c == DM_PAD_C_FACE || !dm_pad_control_drawn(c, full)) continue;
++        BOOL isFaceKey = c >= DM_PAD_C_A && c <= DM_PAD_C_Y;
++        if (isFaceKey && !g.faceSplit) continue;
++        CGPoint d = dm_pad_clamp(&g, full, c);
++        dm_pad_move(&g, c, d.x, d.y);
++        if (o.custom && o.custom->hasPos[set][c]) {
++            dm_pad_move(&g, c, o.custom->dx[set][c] * u0, o.custom->dy[set][c] * u0);
++            d = dm_pad_clamp(&g, full, c);
++            dm_pad_move(&g, c, d.x, d.y);
++            g.moved |= 1u << c;
++        }
++    }
++    return g;
++}
++
++// The geometry the gamepad draws, hit-tests and grabs with: the size and the stick's place (dm_pad_geo_placed), then the player's arrangement,
++// or dm_pad_apply_custom when the in-game editor's per-control scales / fine offsets are active.
+ static inline DmPadGeo dm_pad_geo(CGRect bounds, UIEdgeInsets insets, DmLayout layout, BOOL full, DmPadOptions o) {
++    if (o.custom) {
++        int set = (layout.separated ? DM_PAD_SET_2D_SPLIT : DM_PAD_SET_2D) + (full ? 1 : 0);
++        CGFloat sc = o.scale > 0 ? o.scale : 1;
++        if (fabs(sc - 1) > 0.001 || dm_pad_custom_any_in_set(o.custom, set)) return dm_pad_apply_custom(bounds, insets, layout, full, o);
++    }
+     DmPadGeo g = dm_pad_geo_placed(bounds, insets, layout, full, o);
+     if (layout.customControlsFullBounds && bounds.size.width > bounds.size.height && !layout.separated) g.customBounds = bounds;
+     if (o.layout) dm_pad_arrange(&g, full, layout.separated, o.layout);
+@@ -390,7 +830,10 @@ static inline CGFloat dm_pad_dist(CGPoint a, CGPoint b) { return hypot(a.x - b.x
+ // A locked key's distance from p in units of its hit radius (1 or less is a hit).
+ static inline CGFloat dm_pad_key_distance(const DmPadGeo *g, BOOL sep, int c, CGPoint p) {
+     if (c >= DM_PAD_C_ZL && c <= DM_PAD_C_R) return dm_pad_dist(p, g->drop[c - DM_PAD_C_ZL]) / MAX(g->dropR[c - DM_PAD_C_ZL] * 1.35, sep ? 22 : 0);
+-    if (c == DM_PAD_C_L3 || c == DM_PAD_C_R3) return dm_pad_dist(p, g->click[c - DM_PAD_C_L3]) / MAX(g->clickR * 1.35, sep ? 22 : 0);
++    if (c == DM_PAD_C_L3 || c == DM_PAD_C_R3) {
++        CGFloat r = g->clickKeyR[c - DM_PAD_C_L3] > 0 ? g->clickKeyR[c - DM_PAD_C_L3] : g->clickR;
++        return dm_pad_dist(p, g->click[c - DM_PAD_C_L3]) / MAX(r * 1.35, sep ? 22 : 0);
++    }
+     CGRect r = CGRectInset(g->pill[c - DM_PAD_C_MINUS], -8 * g->u, -8 * g->u);
+     if (!sep && !CGRectContainsPoint(r, p)) return CGFLOAT_MAX;
+     CGFloat w = MAX(r.size.width, sep ? 28 : 0), h = MAX(r.size.height, sep ? 28 : 0);
+@@ -403,7 +846,7 @@ static inline int dm_pad_locked_at(const DmPadGeo *g, BOOL full, BOOL sep, CGPoi
+         int c = dm_pad_locked[i];
+         if ((c == DM_PAD_C_L3 || c == DM_PAD_C_R3) && !full) continue;
+         CGFloat d = dm_pad_key_distance(g, sep, c, p);
+-        if (d <= 1 && (key < 0 || d < kd)) { key = c; kd = d; if (!sep && !g->moved) break; }
++        if (d <= 1 && (key < 0 || d < kd)) { key = c; kd = d; if (!sep && !g->moved && !g->customActive) break; }
+     }
+     if (distance) *distance = kd;
+     return key;
+@@ -412,10 +855,11 @@ static inline int dm_pad_locked_at(const DmPadGeo *g, BOOL full, BOOL sep, CGPoi
+ static inline CGFloat dm_pad_menu_hit_r(const DmPadGeo *g) { return MAX(g->swapR * 1.6, 22); }
+ static inline CGFloat dm_pad_menu_distance(const DmPadGeo *g, CGPoint p) { return dm_pad_dist(p, g->swap) / dm_pad_menu_hit_r(g); }
+ // Whether the menu button takes a touch-down at p (with the controls shown): in its hit circle and nearer than any locked key's target.
+-// A moved control never reaches into that circle (dm_pad_control_fits), so the menu never takes a touch on one.
++// When custom layouts are active, tapping directly on the visible menu gear always opens the menu so a scaled button can never trap the player.
+ static inline BOOL dm_pad_menu_takes(const DmPadGeo *g, BOOL full, BOOL sep, CGPoint p) {
+     CGFloat d = dm_pad_menu_distance(g, p), kd;
+     if (d > 1) return NO;
++    if (g->customActive && dm_pad_dist(p, g->swap) <= MAX(g->swapR * 1.15, 18)) return YES;
+     return dm_pad_locked_at(g, full, sep, p, &kd) < 0 || d < kd;
+ }
+ // A touch-down the menu button did not take. tap: the Tap layout (no control but the menu). stickFree: no touch holds the left stick yet.
+@@ -424,14 +868,58 @@ static inline DmPadHit dm_pad_hit(const DmPadGeo *g, BOOL full, BOOL sep, BOOL t
+     int key = dm_pad_locked_at(g, full, sep, p, NULL);
+     if (key >= 0) return (DmPadHit){DM_PAD_HIT_KEY, key};
+     CGFloat best = 1, f = CGFLOAT_MAX; int kind = DM_PAD_HIT_NONE;
+-    if (g->faceSplit) for (int i = 0; i < 4; i++) f = fmin(f, dm_pad_dist(p, g->faceKey[i]) / MAX(g->faceR * 1.6, g->faceHitR));
+-    else f = dm_pad_dist(p, g->face) / (g->faceGap + MAX(g->faceR * 1.6, g->faceHitR));
++    if (g->faceSplit) {
++        for (int i = 0; i < 4; i++) {
++            CGFloat kr = g->faceKeyR[i] > 0 ? g->faceKeyR[i] : g->faceR;
++            CGFloat khr = g->faceKeyHitR[i] > 0 ? g->faceKeyHitR[i] : g->faceHitR;
++            f = fmin(f, dm_pad_dist(p, g->faceKey[i]) / MAX(kr * (g->customActive ? 1.25 : 1.6), khr));
++        }
++    } else {
++        f = dm_pad_dist(p, g->face) / (g->faceGap + MAX(g->faceR * 1.6, g->faceHitR));
++    }
+     if (f <= best) { best = f; kind = DM_PAD_HIT_FACE; }
+     if (full) { CGFloat d = dm_pad_dist(p, g->dpad) / MAX(g->dpadR * DM_PAD_DPAD_GRAB, sep ? 22 : 0); if (d < best) { best = d; kind = DM_PAD_HIT_DPAD; } }
+     if (stickFree) { CGFloat s = dm_pad_dist(p, g->stick) / MAX(g->stickR * DM_PAD_STICK_GRAB, sep ? 22 : 0); if (s < best) { best = s; kind = DM_PAD_HIT_STICK; } }
+     return (DmPadHit){kind, -1};
+ }
+ 
++// Clamped on-screen centre and radius of a custom macro button, shared by drawing, hit-testing and the layout editor.
++static inline CGPoint dm_pad_macro_center(const DmPadGeo *g, BOOL separated, CGRect controlsBounds, const DmPadMacro *m, CGFloat *_Nullable outR) {
++    CGRect area = separated ? controlsBounds : (CGRectIsNull(g->customBounds) ? controlsBounds : g->customBounds);
++    CGFloat u0 = g->baseU > 0 ? g->baseU : (g->u > 0 ? g->u : 1);
++    CGFloat s = dm_pad_clamp_scale(m->scale > 0 ? m->scale : 1);
++    CGFloat maxR = fmax(20, fmin(area.size.width, area.size.height) * 0.48);
++    CGFloat r = fmin(DM_PAD_FACE_R * u0 * s, maxR);
++    if (outR) *outR = r;
++    if (CGRectIsEmpty(area)) return CGPointZero;
++    CGFloat nx = fmax(0, fmin(1, m->nx)), ny = fmax(0, fmin(1, m->ny));
++    CGFloat cx = CGRectGetMinX(area) + nx * area.size.width;
++    CGFloat cy = CGRectGetMinY(area) + ny * area.size.height;
++    CGFloat minX = CGRectGetMinX(area) + r, maxX = CGRectGetMaxX(area) - r;
++    CGFloat minY = CGRectGetMinY(area) + r, maxY = CGRectGetMaxY(area) - r;
++    cx = minX <= maxX ? fmax(minX, fmin(cx, maxX)) : CGRectGetMidX(area);
++    cy = minY <= maxY ? fmax(minY, fmin(cy, maxY)) : CGRectGetMidY(area);
++    return CGPointMake(cx, cy);
++}
++
++// Nearest active custom macro button hit at p in the given layout set, or -1 for none.
++static inline int dm_pad_macro_hit(const DmPadGeo *g, BOOL separated, CGRect controlsBounds, const DmPadMacros *_Nullable macros, int set, CGPoint p, CGFloat *_Nullable outDist) {
++    int best = -1; CGFloat bd = 1;
++    if (!macros || set < 0 || set >= DM_PAD_SET_N) return -1;
++    for (int i = 0; i < DM_PAD_MACRO_MAX; i++) {
++        const DmPadMacro *m = &macros->items[set][i];
++        if (!m->active || !(m->mask & 0xFFFFu)) continue;
++        CGFloat r = 0;
++        CGPoint c = dm_pad_macro_center(g, separated, controlsBounds, m, &r);
++        CGFloat hitR = MAX(r * 1.2, separated ? 22 : 0);
++        if (hitR <= 0) continue;
++        CGFloat d = dm_pad_dist(p, c) / hitR;
++        if (d <= 1 && (best < 0 || d < bd)) { best = i; bd = d; }
++    }
++    if (outDist) *outDist = bd;
++    return best;
++}
++
+ // Where the 3D layout's right-stick hint goes: a few words, no shape, in the area the undrawn right stick answers in (x from areaMinX to
+ // the right edge), between the top row and the diamond, inside the safe area and clear of every drawn control (a gap of 6 u around it).
+ // text is the label's size including its padding. CGRectNull when there is no room: the hint is then not shown.
 diff --git a/dm/ios/Sources/GameMenu.swift b/dm/ios/Sources/GameMenu.swift
-index 9ee0582..9dd8f60 100644
+index 9ee0582..ad42ddd 100644
 --- a/dm/ios/Sources/GameMenu.swift
 +++ b/dm/ios/Sources/GameMenu.swift
 @@ -1,4 +1,4 @@
@@ -514,8 +2102,8 @@ index 9ee0582..9dd8f60 100644
          UIAction(title: names[l], state: dm_pad_layout() == l ? .on : .off) { _ in dm_pad_layout_set(Int32(l)) }
      }
      let layout = UIMenu(title: GameMenuText.controllerLayout.text, options: .singleSelection, children: layouts)   // a choice's value shows in its submenu: a subtitle would make each row two lines
-+    // The layout editor (DmGamepad.m): move each control, one size for all, one opacity. It works in a game's own app as in the shell, so it is here and not on the settings screen.
-+    // The menu closes first; the editor opens on the next turn of the main loop.
++    // The layout editor (DmGamepad.m): move each control freely, resize globally or per button up to 400%, opacity, and custom macro buttons (e.g. X+A).
++    // It works in a game's own app as in the shell, so it is here and not on the settings screen. The menu closes first; the editor opens on the next turn of the main loop.
 +    var layoutRows: [UIMenuElement] = [layout]
 +    if dm_pad_edit_offered() {
 +        layoutRows.append(UIAction(title: GameMenuText.editLayout.text, image: UIImage(systemName: "slider.horizontal.3")) { _ in
@@ -539,7 +2127,7 @@ index 9ee0582..9dd8f60 100644
      return items
  }
 diff --git a/dm/ios/tests/pad_geometry/pad_geometry_check.m b/dm/ios/tests/pad_geometry/pad_geometry_check.m
-index b78567b..ab1668f 100644
+index b78567b..ca3389a 100644
 --- a/dm/ios/tests/pad_geometry/pad_geometry_check.m
 +++ b/dm/ios/tests/pad_geometry/pad_geometry_check.m
 @@ -148,6 +148,74 @@ static void check_geo(const Screen *s, BOOL full, const DmPadGeo *g, const char
@@ -617,11 +2205,213 @@ index b78567b..ab1668f 100644
  static void check_arrangement(const Screen *screens, int nscreens) {
      // Reset: a layout of zeros, a value that names a control at 0 0, and a value for other layouts are the built-in geometry exactly,
      // the points the gamepad has always used (pinned above on the Pro Max).
-@@ -355,6 +423,7 @@ int main(void) {
+@@ -250,6 +318,199 @@ static void check_duo_outer_custom_bounds(void) {
+         FAIL("Duo outer: full bounds allowed a moved shoulder to overlap another");
+ }
+ 
++static void check_custom_and_macros(const Screen *screens, int nscreens) {
++    // 1. Global & per-control scaling up to 400% across all 14 screens, plus zero-jump drag and menu accessibility.
++    for (int i = 0; i < nscreens; i++) {
++        for (int full = 0; full < 2; full++) {
++            DmLayout l = dm_layout(screens[i].bounds, screens[i].insets, screens[i].partiallyOpen, screens[i].division, DM_PICTURE_16_9);
++            int set = (l.separated ? DM_PAD_SET_2D_SPLIT : DM_PAD_SET_2D) + (full ? 1 : 0);
++            DmPadGeo base = dm_pad_geo(screens[i].bounds, screens[i].insets, l, full, (DmPadOptions){1});
++
++            // Global 400%: controls grow up to the screen cap without shrinking back, while menu gear stays at baseU.
++            DmPadCustom empty = {0};
++            DmPadGeo big = dm_pad_geo(screens[i].bounds, screens[i].insets, l, full, (DmPadOptions){4.0, 0, NULL, &empty});
++            if (!big.customActive) FAIL("%s %s: customActive false at 400%%", screens[i].name, full ? "3D" : "2D");
++            if (!NEAR(big.swapR, base.swapR)) FAIL("%s %s: menu gear scaled with global 400%% (%.1f vs %.1f)", screens[i].name, full ? "3D" : "2D", big.swapR, base.swapR);
++            if (!(big.faceR > base.faceR * 1.8)) FAIL("%s %s: 400%% face did not grow (%.1f vs %.1f)", screens[i].name, full ? "3D" : "2D", big.faceR, base.faceR);
++
++            // Per-control scaling: scaling ONLY ZL to 400% grows ZL without resizing ZR or face keys, and keeps every shape inside bounds.
++            DmPadCustom zlBig = {0};
++            zlBig.scale[set][DM_PAD_C_ZL] = 4.0;
++            DmPadGeo gZL = dm_pad_geo(screens[i].bounds, screens[i].insets, l, full, (DmPadOptions){1.0, 0, NULL, &zlBig});
++            if (!(gZL.dropR[DM_PAD_ZL] > base.dropR[DM_PAD_ZL] * 2.5)) FAIL("%s %s: ZL 400%% too small (%.1f vs %.1f)", screens[i].name, full ? "3D" : "2D", gZL.dropR[DM_PAD_ZL], base.dropR[DM_PAD_ZL]);
++            if (!NEAR(gZL.dropR[DM_PAD_ZR], base.dropR[DM_PAD_ZR])) FAIL("%s %s: ZR changed when only ZL scaled", screens[i].name, full ? "3D" : "2D");
++            if (!NEAR(gZL.faceR, base.faceR)) FAIL("%s %s: face changed when only ZL scaled", screens[i].name, full ? "3D" : "2D");
++
++            // All drawn shapes stay inside the screen / controls area even at 400%.
++            CGRect lim = l.separated ? l.controls : screens[i].bounds;
++            DmPadShape sh[20]; int nsh = dm_pad_shapes(&gZL, full, sh);
++            for (int k = 0; k < nsh; k++) {
++                CGRect box = dm_pad_shape_box(&sh[k]);
++                if (box.origin.x < lim.origin.x - 1 || CGRectGetMaxX(box) > CGRectGetMaxX(lim) + 1 ||
++                    box.origin.y < lim.origin.y - 1 || CGRectGetMaxY(box) > CGRectGetMaxY(lim) + 1)
++                    FAIL("%s %s: shape %d escaped bounds at ZL 400%%", screens[i].name, full ? "3D" : "2D", sh[k].id);
++            }
++
++            // Individual Split ABXY: scaling ONLY A to 400% grows A and leaves B, X, Y untouched in both size and position.
++            DmPadCustom aBig = {0};
++            aBig.scale[set][DM_PAD_C_A] = 4.0;
++            DmPadGeo gA = dm_pad_geo(screens[i].bounds, screens[i].insets, l, full, (DmPadOptions){1.0, 0, NULL, &aBig});
++            if (!gA.faceSplit) FAIL("%s %s: scaling A did not activate faceSplit", screens[i].name, full ? "3D" : "2D");
++            if (!(gA.faceKeyR[0] > base.faceKeyR[0] * 2.5)) FAIL("%s %s: A 400%% too small (%.1f vs %.1f)", screens[i].name, full ? "3D" : "2D", gA.faceKeyR[0], base.faceKeyR[0]);
++            for (int f = 1; f < 4; f++) {
++                if (!NEAR(gA.faceKeyR[f], base.faceKeyR[f])) FAIL("%s %s: face key %d resized when only A scaled", screens[i].name, full ? "3D" : "2D", f);
++                if (!NEAR(dm_pad_face_key(&gA, f).x, dm_pad_face_key(&base, f).x) || !NEAR(dm_pad_face_key(&gA, f).y, dm_pad_face_key(&base, f).y))
++                    FAIL("%s %s: face key %d shifted when only A scaled", screens[i].name, full ? "3D" : "2D", f);
++            }
++
++            // Zero-jump drag invariant: enabling hasPos with dx=0, dy=0 matches hasPos=NO exactly.
++            DmPadCustom zeroPos = aBig;
++            for (int c = 0; c < DM_PAD_C_N; c++) zeroPos.hasPos[set][c] = YES;
++            DmPadGeo gZ = dm_pad_geo(screens[i].bounds, screens[i].insets, l, full, (DmPadOptions){1.0, 0, NULL, &zeroPos});
++            for (int c = 0; c < DM_PAD_C_N; c++) {
++                if (!dm_pad_control_drawn(c, full) || c == DM_PAD_C_FACE) continue;
++                CGPoint p1 = dm_pad_control_ref(&gA, c), p2 = dm_pad_control_ref(&gZ, c);
++                if (!NEAR(p1.x, p2.x) || !NEAR(p1.y, p2.y))
++                    FAIL("%s %s: zero-offset drag jumped control %d (%.1f,%.1f vs %.1f,%.1f)", screens[i].name, full ? "3D" : "2D", c, p1.x, p1.y, p2.x, p2.y);
++            }
++
++            // Menu gear remains reachable even if + is scaled to 400% and moved right onto the gear.
++            DmPadCustom coverMenu = {0};
++            coverMenu.scale[set][DM_PAD_C_PLUS] = 4.0;
++            coverMenu.hasPos[set][DM_PAD_C_PLUS] = YES;
++            coverMenu.dx[set][DM_PAD_C_PLUS] = (base.swap.x - dm_pad_control_ref(&base, DM_PAD_C_PLUS).x) / base.baseU;
++            coverMenu.dy[set][DM_PAD_C_PLUS] = (base.swap.y - dm_pad_control_ref(&base, DM_PAD_C_PLUS).y) / base.baseU;
++            DmPadGeo gM = dm_pad_geo(screens[i].bounds, screens[i].insets, l, full, (DmPadOptions){1.0, 0, NULL, &coverMenu});
++            if (!dm_pad_menu_takes(&gM, full, l.separated, gM.swap))
++                FAIL("%s %s: menu gear blocked by 400%% button", screens[i].name, full ? "3D" : "2D");
++        }
++    }
++
++    // Exact 400% check on iPhone Pro Max (screens[3], u0 = 1.0): A grows to exact 4 * 27 = 108 pt radius while B stays at 27 pt!
++    {
++        DmLayout l = dm_layout(screens[3].bounds, screens[3].insets, NO, CGRectNull, DM_PICTURE_16_9);
++        DmPadCustom c400 = {0}; c400.scale[DM_PAD_SET_3D][DM_PAD_C_A] = 4.0;
++        DmPadGeo g = dm_pad_geo(screens[3].bounds, screens[3].insets, l, YES, (DmPadOptions){1.0, 0, NULL, &c400});
++        if (!NEAR(g.faceKeyR[0], 108.0)) FAIL("Pro Max A 400%%: radius %.2f, want 108.0", g.faceKeyR[0]);
++        if (!NEAR(g.faceKeyR[1], 27.0)) FAIL("Pro Max B at A 400%%: radius %.2f, want 27.0", g.faceKeyR[1]);
++    }
++
++    // 2. DmPadCustom encode/parse round-trip, forward-compat skipping, malformed input rejection and fuzzing.
++    {
++        DmPadCustom src = {0}, dst = {0};
++        src.scale[DM_PAD_SET_2D][DM_PAD_C_A] = 4.0;
++        src.scale[DM_PAD_SET_3D][DM_PAD_C_ZL] = 0.4;
++        src.scale[DM_PAD_SET_3D][DM_PAD_C_STICK] = 2.25;
++        src.hasPos[DM_PAD_SET_3D][DM_PAD_C_STICK] = YES;
++        src.dx[DM_PAD_SET_3D][DM_PAD_C_STICK] = 42.5;
++        src.dy[DM_PAD_SET_3D][DM_PAD_C_STICK] = -18.3;
++        src.hasPos[DM_PAD_SET_2D_SPLIT][DM_PAD_C_PLUS] = YES;
++        src.dx[DM_PAD_SET_2D_SPLIT][DM_PAD_C_PLUS] = -12.0;
++        src.dy[DM_PAD_SET_2D_SPLIT][DM_PAD_C_PLUS] = 0.0;
++        char buf[DM_PAD_CUSTOM_MAX + 1];
++        int len = dm_pad_custom_encode(&src, buf, sizeof buf);
++        if (len <= 0) FAIL("DmPadCustom encode failed");
++        if (!dm_pad_custom_parse(buf, &dst)) FAIL("DmPadCustom parse failed on '%s'", buf);
++        if (dm_pad_custom_count(&dst) != 4) FAIL("DmPadCustom count %d, want 4", dm_pad_custom_count(&dst));
++        if (!NEAR(dst.scale[DM_PAD_SET_2D][DM_PAD_C_A], 4.0)) FAIL("DmPadCustom A scale %.3f", dst.scale[DM_PAD_SET_2D][DM_PAD_C_A]);
++        if (!NEAR(dst.scale[DM_PAD_SET_3D][DM_PAD_C_ZL], 0.4)) FAIL("DmPadCustom ZL scale %.3f", dst.scale[DM_PAD_SET_3D][DM_PAD_C_ZL]);
++        if (!dst.hasPos[DM_PAD_SET_3D][DM_PAD_C_STICK] || !NEAR(dst.dx[DM_PAD_SET_3D][DM_PAD_C_STICK], 42.5) || !NEAR(dst.dy[DM_PAD_SET_3D][DM_PAD_C_STICK], -18.3))
++            FAIL("DmPadCustom STICK pos mismatch");
++        if (!dst.hasPos[DM_PAD_SET_2D_SPLIT][DM_PAD_C_PLUS]) FAIL("DmPadCustom PLUS hasPos lost");
++
++        // Forward-compatible skip of unknown set/control names (matching DM_TOUCH_LAYOUT).
++        if (!dm_pad_custom_parse("c1;4d/a:s2000;2d/home:s2000/b:s2500", &dst) || dm_pad_custom_count(&dst) != 1 || !NEAR(dst.scale[DM_PAD_SET_2D][DM_PAD_C_B], 2.5))
++            FAIL("DmPadCustom forward-compat skip failed");
++
++        static const char *badCustom[] = {"v9;bad", "c2;2d/a:s1000", "c1;2d/a:sabc", "c1;2d/a:p10", "c1;2d/a:s0", "c1;2d/a:s99999", "c1;2d/a:z1", "c1;2d/a:"};
++        for (size_t k = 0; k < sizeof badCustom / sizeof *badCustom; k++) {
++            DmPadCustom tmp;
++            if (dm_pad_custom_parse(badCustom[k], &tmp)) FAIL("DmPadCustom accepted bad input '%s'", badCustom[k]);
++        }
++        if (!dm_pad_custom_parse("", &dst) || dm_pad_custom_count(&dst) != 0) FAIL("DmPadCustom empty parse failed");
++        char tiny[4];
++        if (dm_pad_custom_encode(&src, tiny, sizeof tiny) >= 0) FAIL("DmPadCustom encoded into 4-byte buffer");
++
++        // Fuzz dm_pad_custom_parse with 10,000 random strings.
++        uint32_t rng = 1337;
++        static const char ca[] = "c1;/:,sp-01234567892d3d2s3sabxy";
++        for (int k = 0; k < 10000; k++) {
++            char v[64]; int n = 2 + (int)(rng % 60);
++            v[0] = 'c'; v[1] = '1';
++            for (int j = 2; j < n; j++) { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; v[j] = ca[rng % (sizeof ca - 1)]; }
++            v[n] = 0;
++            DmPadCustom fz; dm_pad_custom_parse(v, &fz);
++        }
++    }
++
++    // 3. Custom macro buttons: default label generation ("X+A"), encode/parse round-trip, clamping, hit testing and fuzzing.
++    {
++        char lbl[DM_PAD_MACRO_LABEL_MAX + 1];
++        dm_pad_macro_default_label((1ull << 2) | (1ull << 0), lbl, sizeof lbl);   // X + A
++        if (strcmp(lbl, "X+A") != 0) FAIL("macro default label for X+A was '%s'", lbl);
++        dm_pad_macro_default_label((1ull << 8) | (1ull << 7), lbl, sizeof lbl);   // ZL + R
++        if (strcmp(lbl, "ZL+R") != 0) FAIL("macro default label for ZL+R was '%s'", lbl);
++
++        DmPadMacros src = {0}, dst = {0};
++        src.items[DM_PAD_SET_3D][0] = (DmPadMacro){YES, (1ull << 2) | (1ull << 0), 0.50, 0.25, 1.5, DM_PAD_MACRO_HOLD, "X+A"};
++        src.items[DM_PAD_SET_3D][1] = (DmPadMacro){YES, (1ull << 8) | (1ull << 9), 0.65, 0.30, 4.0, DM_PAD_MACRO_TOGGLE, "A/B; %"};
++        src.items[DM_PAD_SET_3D][2] = (DmPadMacro){YES, (1ull << 1), 0.35, 0.35, 0.4, DM_PAD_MACRO_TURBO, "TURBO B"};
++        char mbuf[DM_PAD_MACROS_STR_MAX + 1];
++        int mlen = dm_pad_macros_encode(&src, mbuf, sizeof mbuf);
++        if (mlen <= 0) FAIL("DmPadMacros encode failed");
++        if (!dm_pad_macros_parse(mbuf, &dst)) FAIL("DmPadMacros parse failed on '%s'", mbuf);
++        if (dm_pad_macros_count_in_set(&dst, DM_PAD_SET_3D) != 3) FAIL("DmPadMacros count %d, want 3", dm_pad_macros_count_in_set(&dst, DM_PAD_SET_3D));
++        if (!dst.items[DM_PAD_SET_3D][0].active || dst.items[DM_PAD_SET_3D][0].mask != ((1ull << 2) | (1ull << 0)) || strcmp(dst.items[DM_PAD_SET_3D][0].label, "X+A") != 0)
++            FAIL("DmPadMacros item 0 mismatch");
++        if (dst.items[DM_PAD_SET_3D][1].mode != DM_PAD_MACRO_TOGGLE || !NEAR(dst.items[DM_PAD_SET_3D][1].scale, 4.0) || strcmp(dst.items[DM_PAD_SET_3D][1].label, "A/B; %") != 0)
++            FAIL("DmPadMacros item 1 mismatch (label '%s')", dst.items[DM_PAD_SET_3D][1].label);
++        if (dst.items[DM_PAD_SET_3D][2].mode != DM_PAD_MACRO_TURBO || !NEAR(dst.items[DM_PAD_SET_3D][2].scale, 0.4))
++            FAIL("DmPadMacros item 2 mismatch");
++
++        // Forward-compatible skip of unknown set name.
++        if (!dm_pad_macros_parse("m1;4d/5,5000,5000,1000,0,X;3d/5,5000,5000,1000,0,X+A", &dst) || dm_pad_macros_count(&dst) != 1)
++            FAIL("DmPadMacros forward-compat skip failed");
++
++        // Clamping & hit-testing on all 14 screens, including 400% macro and overlapping macro disambiguation.
++        for (int i = 0; i < nscreens; i++) {
++            DmLayout l = dm_layout(screens[i].bounds, screens[i].insets, screens[i].partiallyOpen, screens[i].division, DM_PICTURE_16_9);
++            int set = l.separated ? DM_PAD_SET_3D_SPLIT : DM_PAD_SET_3D;
++            DmPadMacros ms = {0};
++            ms.items[set][0] = (DmPadMacro){YES, (1ull << 2) | (1ull << 0), 0.99, 0.01, 4.0, DM_PAD_MACRO_HOLD, "X+A"};
++            ms.items[set][1] = (DmPadMacro){YES, (1ull << 1), 0.50, 0.50, 1.0, DM_PAD_MACRO_HOLD, "B"};
++            DmPadGeo g = dm_pad_geo(screens[i].bounds, screens[i].insets, l, YES, (DmPadOptions){1.0});
++            CGRect area = l.separated ? l.controls : screens[i].bounds;
++            CGFloat r0 = 0, r1 = 0;
++            CGPoint c0 = dm_pad_macro_center(&g, l.separated, l.controls, &ms.items[set][0], &r0);
++            CGPoint c1 = dm_pad_macro_center(&g, l.separated, l.controls, &ms.items[set][1], &r1);
++            if (c0.x - r0 < area.origin.x - 0.5 || c0.x + r0 > CGRectGetMaxX(area) + 0.5 ||
++                c0.y - r0 < area.origin.y - 0.5 || c0.y + r0 > CGRectGetMaxY(area) + 0.5)
++                FAIL("%s: 400%% macro escaped bounds", screens[i].name);
++            if (dm_pad_macro_hit(&g, l.separated, l.controls, &ms, set, c0, NULL) != 0)
++                FAIL("%s: macro 0 center did not hit", screens[i].name);
++            if (dm_pad_macro_hit(&g, l.separated, l.controls, &ms, set, c1, NULL) != 1)
++                FAIL("%s: macro 1 center did not hit", screens[i].name);
++        }
++
++        static const char *badMacros[] = {"m9;bad", "m1;3d/0,5000,5000,1000,0,X", "m1;3d/5,5000,5000,1000,9,X", "m1;3d/5,5000,5000,9999,0,X", "m1;3d/5,5000,5000,1000,0,%GG", "m1;3d/5,5000"};
++        for (size_t k = 0; k < sizeof badMacros / sizeof *badMacros; k++) {
++            DmPadMacros tmp;
++            if (dm_pad_macros_parse(badMacros[k], &tmp)) FAIL("DmPadMacros accepted bad input '%s'", badMacros[k]);
++        }
++
++        // Fuzz dm_pad_macros_parse with 10,000 random strings.
++        uint32_t rng = 4242;
++        static const char ma[] = "m1;/,%0123456789abcdefABX+2d3d";
++        for (int k = 0; k < 10000; k++) {
++            char v[64]; int n = 2 + (int)(rng % 60);
++            v[0] = 'm'; v[1] = '1';
++            for (int j = 2; j < n; j++) { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; v[j] = ma[rng % (sizeof ma - 1)]; }
++            v[n] = 0;
++            DmPadMacros fz; dm_pad_macros_parse(v, &fz);
++        }
++    }
++}
++
+ int main(void) {
+     const Screen screens[] = {
+         // iPhone landscape (the phone's only orientation): the Dynamic Island or notch on one side, the home indicator at the bottom.
+@@ -355,7 +616,9 @@ int main(void) {
  
      check_layout_values();
      check_arrangement(screens, nscreens);
 +    check_editor(screens, nscreens);
      check_duo_outer_custom_bounds();
++    check_custom_and_macros(screens, nscreens);
  
      if (!g_fail) printf("ok: %d screens, %d arrangements\n", nscreens, g_arranged);
+     return g_fail > 100 ? 100 : g_fail;
