@@ -30,11 +30,11 @@ Reason: Let a game's own app (no launcher) edit the touch controls in game: move
 Issue: none
 ---
  dm/ios/Sources/DmGameMenu.h                   |    4 +-
- dm/ios/Sources/DmGamepad.m                    | 1247 ++++++++++++++++-
+ dm/ios/Sources/DmGamepad.m                    | 1272 ++++++++++++++++-
  dm/ios/Sources/DmPadGeometry.h                |  512 ++++++-
  dm/ios/Sources/GameMenu.swift                 |   17 +-
  .../tests/pad_geometry/pad_geometry_check.m   |  263 ++++
- 5 files changed, 1990 insertions(+), 53 deletions(-)
+ 5 files changed, 2013 insertions(+), 55 deletions(-)
 
 diff --git a/dm/ios/Sources/DmGameMenu.h b/dm/ios/Sources/DmGameMenu.h
 index a7e9c69..9c6289d 100644
@@ -56,7 +56,7 @@ index a7e9c69..9c6289d 100644
  bool dm_setting_live(const char *env, const char *value);
  void *dm_quit_menu(void);   // front_ios.m: the menu's last item, Quit <game>, which opens the quit prompt (a retained UIMenu, shown inline)   // front_ios.m: value NULL asks whether the running game takes env at once; otherwise applies it
 diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
-index 9860743..5295666 100644
+index 9860743..bc9be50 100644
 --- a/dm/ios/Sources/DmGamepad.m
 +++ b/dm/ios/Sources/DmGamepad.m
 @@ -40,7 +40,7 @@
@@ -90,7 +90,7 @@ index 9860743..5295666 100644
  @end
  // The menu button: a UIButton whose menu is the in-game menu (UIKit draws it and takes the touches while it is open). Its hit circle is larger than the drawn one, and a key nearer
  // to the touch wins (− / + sit beside it), so it asks the pad
-@@ -156,17 +164,571 @@ void front_ios_quit_controllers(void);   // front_ios.m: the controllers changed
+@@ -156,17 +164,577 @@ void front_ios_quit_controllers(void);   // front_ios.m: the controllers changed
      [super contextMenuInteraction:i willEndForConfiguration:c animator:a]; [(DmGamepad *)self.superview setMenuOpen:NO];
  }
  @end
@@ -120,54 +120,54 @@ index 9860743..5295666 100644
 +    UISwitch *_apart;
 +    UIButton *_allBtn, *_collapseBtn, *_resetItemBtn, *_editMacroBtn, *_deleteMacroBtn, *_addMacroBtn, *_doneCompactBtn;
 +    UIStackView *_bodyStack;
-+    NSArray<UIView *> *_widthRows;   // the rows that must stay on one line (title, context, actions)
-+    CGFloat _minWidth;               // cached width those rows need; 0 = measure again
-+    BOOL _collapsed, _hasSelection, _wasMacro, _wasFull;
++    CGFloat _minWidth;   // the width the widest row needs, worked out once from the measured words (minimumUsableWidth)
++    BOOL _collapsed, _hasSelection;
 +}
 +static UILabel *edit_label(NSString *text, CGFloat size, UIFontWeight weight, CGFloat alpha) {
 +    UILabel *l = [UILabel new]; l.text = text; l.font = [UIFont systemFontOfSize:size weight:weight]; l.textColor = [UIColor colorWithWhite:1 alpha:alpha]; l.numberOfLines = 0;
 +    return l;
 +}
-+// Every button on the two cards keeps its title on one horizontal line. A UIButtonConfiguration title takes its font from Dynamic Type and
-+// wraps when its row runs out of room, so a raised text size (or a narrow screen) turned "Cancel" and "Reset" into a column of single
-+// letters. Three things keep the words flat: the title font is pinned to the card's own scale (every label here is a fixed size too), the
-+// title label is held to a single line, and the button resists being squeezed below that line, so the row's spacer closes up first. The
-+// card then widens itself to the width the rows actually need (minimumUsableWidth below), up to the safe area.
-+static UIFont *edit_capped_font(CGFloat size, UIFontWeight weight) {   // follows the text size setting, but only up to +3pt: the cards are fixed-size panels
-+    UIFont *base = [UIFont systemFontOfSize:size weight:weight];
-+    return [[UIFontMetrics metricsForTextStyle:UIFontTextStyleSubheadline] scaledFontForFont:base maximumPointSize:size + 3];
-+}
-+static UIButtonConfiguration *edit_flat_title(UIButtonConfiguration *c, CGFloat size) {
-+    c.titleTextAttributesTransformer = ^NSDictionary<NSAttributedStringKey, id> *(NSDictionary<NSAttributedStringKey, id> *attrs) {
-+        NSMutableDictionary<NSAttributedStringKey, id> *out = [attrs mutableCopy];
-+        out[NSFontAttributeName] = edit_capped_font(size, UIFontWeightSemibold);
-+        return out;
-+    };
++// No word on these two cards is ever laid out down the screen. The fork report: in landscape the Edit Layout card read "C a n c e l" and
++// "R e s e t" vertically, one letter per line. A UIButtonConfiguration lays its title out as a paragraph, so the moment its row runs short
++// of width UIKit breaks the word and the letters walk down the card; asking the title label for one line afterwards does not stop it,
++// because the configuration owns that label. So nothing here is left to UIKit's judgement:
++//   - a title is an attributed string whose paragraph style CLIPS instead of breaking, so the text engine cannot open a second line at all;
++//   - a title uses a plain fixed font (the card's own scale, like every label on it), so its width can be measured exactly, up front;
++//   - a button carries that measured width as a constraint it will not go under, and the row's flexible spacer closes up before it does;
++//   - the card asks to be as wide as its widest row needs (minimumUsableWidth) before it is placed, so the rows are never squeezed at all.
++// The widths are plain arithmetic on measured text, never a layout-engine guess, so the card cannot oscillate or disagree with itself.
++static const CGFloat k_edit_badge_w = 150;   // the selection badge's budgeted width: "Macro: ZL+ZR+L3" reads in full, longer labels truncate
++static UIFont *edit_btn_font(CGFloat size) { return [UIFont systemFontOfSize:size weight:UIFontWeightSemibold]; }
++static CGFloat edit_text_width(NSString *s, UIFont *f) { return ceil([(s ?: @"") sizeWithAttributes:@{NSFontAttributeName: f}].width); }
++static CGFloat edit_btn_width(NSString *title, CGFloat size) { return edit_text_width(title, edit_btn_font(size)) + 26; }   // 12pt of padding a side, 2pt of slack
++static UIButtonConfiguration *edit_flat_title(UIButtonConfiguration *c, NSString *title, CGFloat size) {
++    NSMutableParagraphStyle *ps = [NSMutableParagraphStyle new];
++    ps.lineBreakMode = NSLineBreakByClipping;   // the one line this title will ever have
++    ps.alignment = NSTextAlignmentCenter;
++    c.title = nil;                              // an attributed title wins over a plain one: keep only the one that carries the style
++    c.attributedTitle = [[NSAttributedString alloc] initWithString:title ?: @"" attributes:@{
++        NSFontAttributeName: edit_btn_font(size), NSParagraphStyleAttributeName: ps,
++    }];
++    c.contentInsets = NSDirectionalEdgeInsetsMake(5, 12, 5, 12);
++    if (@available(iOS 16.0, *)) c.titleLineBreakMode = NSLineBreakByClipping;
 +    return c;
 +}
-+static void edit_one_line(UIButton *b) {
-+    b.titleLabel.numberOfLines = 1; b.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-+    b.titleLabel.adjustsFontSizeToFitWidth = YES; b.titleLabel.minimumScaleFactor = 0.75;
++static void edit_one_line(UIButton *b, CGFloat width) {
++    b.titleLabel.numberOfLines = 1; b.titleLabel.lineBreakMode = NSLineBreakByClipping;
++    b.titleLabel.adjustsFontSizeToFitWidth = NO;
 +    [b setContentCompressionResistancePriority:UILayoutPriorityRequired - 1 forAxis:UILayoutConstraintAxisHorizontal];
 +    [b setContentHuggingPriority:UILayoutPriorityDefaultHigh forAxis:UILayoutConstraintAxisHorizontal];
-+    [b.heightAnchor constraintGreaterThanOrEqualToConstant:30].active = YES;   // the smaller title must not shrink the touch target
-+    b.configurationUpdateHandler = ^(UIButton *btn) {   // a new title or state rebuilds the label: hold it to the one line (no self captured)
-+        btn.titleLabel.numberOfLines = 1; btn.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-+        btn.titleLabel.adjustsFontSizeToFitWidth = YES; btn.titleLabel.minimumScaleFactor = 0.75;
++    NSLayoutConstraint *w = [b.widthAnchor constraintGreaterThanOrEqualToConstant:width];   // the words' own width: the button never goes under it
++    w.priority = UILayoutPriorityRequired - 1; w.active = YES;
++    NSLayoutConstraint *h = [b.heightAnchor constraintGreaterThanOrEqualToConstant:30];     // and stays a 30pt tap target
++    h.priority = UILayoutPriorityDefaultHigh; h.active = YES;
++    b.configurationUpdateHandler = ^(UIButton *btn) {   // a new title or state rebuilds the label: hold the one line (captures no self)
++        btn.titleLabel.numberOfLines = 1; btn.titleLabel.lineBreakMode = NSLineBreakByClipping;
 +    };
 +}
-+static UILabel *edit_flat_label(UILabel *l) {   // a row label never stacks its letters either: one line, shrink a little, then truncate
-+    l.numberOfLines = 1; l.lineBreakMode = NSLineBreakByTruncatingTail;
-+    l.adjustsFontSizeToFitWidth = YES; l.minimumScaleFactor = 0.8;
++static UILabel *edit_flat_label(UILabel *l) {   // a card label keeps its one line too: shorten the words, never stack them
++    l.numberOfLines = 1; l.lineBreakMode = NSLineBreakByTruncatingTail; l.adjustsFontSizeToFitWidth = NO;
 +    return l;
-+}
-+static CGFloat edit_rows_width(NSArray<UIView *> *rows) {   // the widest row at its natural size: what the card needs to stay on one line
-+    CGFloat w = 0;
-+    for (UIView *r in rows) {
-+        if (r.hidden) continue;
-+        w = fmax(w, ceil([r systemLayoutSizeFittingSize:UILayoutFittingCompressedSize].width));
-+    }
-+    return w;
 +}
 +- (UIStackView *)rowNamed:(UILabel *)nameLabel slider:(UISlider *)slider value:(UILabel *)value {
 +    [nameLabel.widthAnchor constraintEqualToConstant:58].active = YES;
@@ -181,9 +181,8 @@ index 9860743..5295666 100644
 +}
 +- (UIButton *)button:(NSString *)title style:(int)style tint:(UIColor *)tint action:(void (^)(void))block {
 +    UIButtonConfiguration *c = style == 2 ? [UIButtonConfiguration filledButtonConfiguration] : style == 1 ? [UIButtonConfiguration tintedButtonConfiguration] : [UIButtonConfiguration plainButtonConfiguration];
-+    c.title = title; c.buttonSize = UIButtonConfigurationSizeSmall; c.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-+    c.contentInsets = NSDirectionalEdgeInsetsMake(5, 11, 5, 11);
-+    c = edit_flat_title(c, 13);
++    c.buttonSize = UIButtonConfigurationSizeSmall; c.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
++    c = edit_flat_title(c, title, 13);
 +    if (tint) {
 +        c.baseForegroundColor = tint;
 +        if (style == 1 || style == 2) c.baseBackgroundColor = tint;
@@ -191,7 +190,7 @@ index 9860743..5295666 100644
 +        c.baseForegroundColor = [UIColor colorWithRed:1 green:0.45 blue:0.4 alpha:1];
 +    }
 +    UIButton *b = [UIButton buttonWithConfiguration:c primaryAction:[UIAction actionWithHandler:^(UIAction *a) { (void)a; if (block) block(); }]];
-+    edit_one_line(b);
++    edit_one_line(b, edit_btn_width(title, 13));
 +    return b;
 +}
 +- (instancetype)initWithScale:(CGFloat)scale opacity:(CGFloat)opacity apart:(BOOL)apart min:(CGFloat)smin max:(CGFloat)smax opacityMin:(CGFloat)omin {
@@ -204,10 +203,10 @@ index 9860743..5295666 100644
 +        UIColor *cyan = [UIColor colorWithRed:0.35 green:0.82 blue:1.0 alpha:1];
 +        UIColor *danger = [UIColor colorWithRed:1.0 green:0.45 blue:0.4 alpha:1];
 +
-+        UILabel *title = edit_label(@"Edit Layout", 15, UIFontWeightBold, 1);
++        UILabel *title = edit_flat_label(edit_label(@"Edit Layout", 15, UIFontWeightBold, 1));
 +        [title setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
-+        _badge = edit_label(@"All Controls", 11, UIFontWeightSemibold, 0.95);
-+        _badge.textColor = cyan; _badge.textAlignment = NSTextAlignmentCenter; _badge.numberOfLines = 1;
++        _badge = edit_flat_label(edit_label(@"All Controls", 11, UIFontWeightSemibold, 0.95));
++        _badge.textColor = cyan; _badge.textAlignment = NSTextAlignmentCenter;
 +        _badge.backgroundColor = [UIColor colorWithRed:0.35 green:0.82 blue:1.0 alpha:0.16];
 +        _badge.layer.cornerRadius = 9; _badge.layer.masksToBounds = YES;
 +        [_badge setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
@@ -216,6 +215,7 @@ index 9860743..5295666 100644
 +            [_badge.topAnchor constraintEqualToAnchor:badgeWrap.topAnchor], [_badge.bottomAnchor constraintEqualToAnchor:badgeWrap.bottomAnchor],
 +            [_badge.leadingAnchor constraintEqualToAnchor:badgeWrap.leadingAnchor], [_badge.trailingAnchor constraintEqualToAnchor:badgeWrap.trailingAnchor],
 +            [_badge.heightAnchor constraintEqualToConstant:20], [_badge.widthAnchor constraintGreaterThanOrEqualToConstant:72],
++            [_badge.widthAnchor constraintLessThanOrEqualToConstant:k_edit_badge_w],   // a long macro name truncates here rather than widening the row past its budget
 +        ]];
 +
 +        UIView *topSpacer = [UIView new]; [topSpacer setContentHuggingPriority:UILayoutPriorityDefaultLow - 1 forAxis:UILayoutConstraintAxisHorizontal];
@@ -228,6 +228,7 @@ index 9860743..5295666 100644
 +        UIStackView *titleRow = [[UIStackView alloc] initWithArrangedSubviews:@[title, badgeWrap, topSpacer, _allBtn, _doneCompactBtn, _collapseBtn]];
 +        titleRow.axis = UILayoutConstraintAxisHorizontal; titleRow.spacing = 6; titleRow.alignment = UIStackViewAlignmentCenter;
 +        _subtitle = edit_label(@"Tap any control to resize (up to 400%) · Drag to move · Drag here to move card", 11, UIFontWeightRegular, 0.58);
++        _subtitle.numberOfLines = 2; _subtitle.lineBreakMode = NSLineBreakByTruncatingTail;   // a sentence may take two lines; a word never takes a column
 +        UIStackView *head = [[UIStackView alloc] initWithArrangedSubviews:@[titleRow, _subtitle]];
 +        head.axis = UILayoutConstraintAxisVertical; head.spacing = 3;
 +        UIView *grip = [UIView new]; head.translatesAutoresizingMaskIntoConstraints = NO; [grip addSubview:head];
@@ -237,16 +238,16 @@ index 9860743..5295666 100644
 +        ]];
 +        [grip addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
 +
-+        _sizeName = edit_label(@"All Size", 13, UIFontWeightMedium, 0.88);
++        _sizeName = edit_flat_label(edit_label(@"All Size", 13, UIFontWeightMedium, 0.88));
 +        _size = [UISlider new]; _size.minimumValue = smin; _size.maximumValue = smax; _size.value = scale;
 +        _size.minimumTrackTintColor = cyan;
-+        _sizeValue = edit_label(@"", 13, UIFontWeightMedium, 0.92);
++        _sizeValue = edit_flat_label(edit_label(@"", 13, UIFontWeightMedium, 0.92));
 +        _sizeValue.userInteractionEnabled = YES;
 +        [_sizeValue addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(sizeValueTapped)]];
 +        [_size addTarget:self action:@selector(sizeChanged) forControlEvents:UIControlEventValueChanged];
 +
 +        _opacity = [UISlider new]; _opacity.minimumValue = omin; _opacity.maximumValue = 1; _opacity.value = opacity;
-+        _opacityValue = edit_label(@"", 13, UIFontWeightMedium, 0.85);
++        _opacityValue = edit_flat_label(edit_label(@"", 13, UIFontWeightMedium, 0.85));
 +        [_opacity addTarget:self action:@selector(opacityChanged) forControlEvents:UIControlEventValueChanged];
 +
 +        UILabel *apartName = edit_flat_label(edit_label(@"Split ABXY", 12, UIFontWeightMedium, 0.85));
@@ -271,13 +272,13 @@ index 9860743..5295666 100644
 +        contextRow.axis = UILayoutConstraintAxisHorizontal; contextRow.spacing = 6; contextRow.alignment = UIStackViewAlignmentCenter;
 +
 +        _addMacroBtn = [self button:@"+ Macro" style:1 tint:cyan action:^{ if (weak.onAddMacro) weak.onAddMacro(); }];
++        [_addMacroBtn.widthAnchor constraintGreaterThanOrEqualToConstant:edit_btn_width(@"Max 12", 13)].active = YES;   // the same button also reads "Max 12"
 +        UIButtonConfiguration *rcfg = [UIButtonConfiguration plainButtonConfiguration];
-+        rcfg.title = @"Reset"; rcfg.buttonSize = UIButtonConfigurationSizeSmall; rcfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-+        rcfg.contentInsets = NSDirectionalEdgeInsetsMake(5, 11, 5, 11);
-+        rcfg = edit_flat_title(rcfg, 13);
++        rcfg.buttonSize = UIButtonConfigurationSizeSmall; rcfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
++        rcfg = edit_flat_title(rcfg, @"Reset", 13);
 +        rcfg.baseForegroundColor = danger;
 +        UIButton *resetBtn = [UIButton buttonWithConfiguration:rcfg primaryAction:nil];
-+        edit_one_line(resetBtn);
++        edit_one_line(resetBtn, edit_btn_width(@"Reset", 13));
 +        resetBtn.showsMenuAsPrimaryAction = YES;
 +        UIAction *resetLayoutAct = [UIAction actionWithTitle:@"Reset Positions & Sizes" image:[UIImage systemImageNamed:@"arrow.counterclockwise"] identifier:nil handler:^(UIAction *a) { (void)a; if (weak.onReset) weak.onReset(NO); }];
 +        UIAction *resetAllAct = [UIAction actionWithTitle:@"Reset Everything (incl. Macros)" image:[UIImage systemImageNamed:@"trash"] identifier:nil handler:^(UIAction *a) { (void)a; if (weak.onReset) weak.onReset(YES); }];
@@ -291,7 +292,19 @@ index 9860743..5295666 100644
 +            [self button:@"Done" style:2 tint:nil action:^{ if (weak.onDone) weak.onDone(); }],
 +        ]];
 +        buttons.axis = UILayoutConstraintAxisHorizontal; buttons.spacing = 6; buttons.alignment = UIStackViewAlignmentCenter;
-+        _widthRows = @[titleRow, contextRow, buttons];   // these three carry words side by side: the card is never narrower than they need
++
++        // The width the card asks for: its widest row, added up from the measured words, so no row is ever asked to squeeze. Worked out
++        // once, from the worst case of each row (every button of the row visible, the badge at its full width), so the card keeps one
++        // width while the player taps from control to control instead of resizing under their finger.
++        CGFloat gap = 6, sw = 51;   // the row spacing and the (0.82-scaled) switch
++        CGFloat titleRowNeed = edit_text_width(@"Edit Layout", [UIFont systemFontOfSize:15 weight:UIFontWeightBold]) + gap + k_edit_badge_w + gap
++                             + edit_btn_width(@"All", 13) + gap + edit_btn_width(@"Done", 13) + gap + edit_btn_width(@"▾", 13);
++        CGFloat contextRowNeed = edit_text_width(@"Split ABXY", [UIFont systemFontOfSize:12 weight:UIFontWeightMedium]) + gap + sw + gap
++                               + fmax(edit_text_width(@"Tap a button to edit", [UIFont systemFontOfSize:11 weight:UIFontWeightRegular]),
++                                      edit_btn_width(@"Reset Item", 13) + gap + edit_btn_width(@"Edit", 13) + gap + edit_btn_width(@"Delete", 13));
++        CGFloat actionRowNeed = fmax(edit_btn_width(@"+ Macro", 13), edit_btn_width(@"Max 12", 13)) + gap + edit_btn_width(@"Reset", 13) + 16
++                              + edit_btn_width(@"Cancel", 13) + gap + edit_btn_width(@"Done", 13);
++        _minWidth = ceil(fmax(fmax(titleRowNeed, contextRowNeed), actionRowNeed)) + 28;   // + the card's left and right padding
 +
 +        _bodyStack = [[UIStackView alloc] initWithArrangedSubviews:@[
 +            [self rowNamed:_sizeName slider:_size value:_sizeValue],
@@ -313,14 +326,11 @@ index 9860743..5295666 100644
 +}
 +- (void)toggleCollapse {
 +    _collapsed = !_collapsed;
-+    _minWidth = 0;
 +    _bodyStack.hidden = _collapsed;
 +    _subtitle.hidden = _collapsed;
 +    _doneCompactBtn.hidden = !_collapsed;
 +    _allBtn.hidden = _collapsed || !_hasSelection;
-+    UIButtonConfiguration *c = _collapseBtn.configuration;
-+    c.title = _collapsed ? @"▾" : @"▴";
-+    _collapseBtn.configuration = c;
++    _collapseBtn.configuration = edit_flat_title(_collapseBtn.configuration, _collapsed ? @"▾" : @"▴", 13);
 +    if ([self.superview isKindOfClass:DmGamepad.class]) [(DmGamepad *)self.superview editPlaceCard];
 +}
 +- (void)showValues {
@@ -329,11 +339,8 @@ index 9860743..5295666 100644
 +}
 +- (void)setSelectionName:(NSString *)name isMacro:(BOOL)isMacro hasSelection:(BOOL)hasSelection scale:(CGFloat)scale opacity:(CGFloat)opacity apart:(BOOL)apart macroCount:(int)macroCount {
 +    _hasSelection = hasSelection;
-+    NSString *badge = [NSString stringWithFormat:@"  %@  ", name ?: @"All Controls"];
 +    BOOL full = macroCount >= DM_PAD_MACRO_MAX;
-+    if (![badge isEqualToString:_badge.text] || isMacro != _wasMacro || full != _wasFull) _minWidth = 0;   // the words in the rows changed: measure again
-+    _wasMacro = isMacro; _wasFull = full;
-+    _badge.text = badge;
++    _badge.text = [NSString stringWithFormat:@"  %@  ", name ?: @"All Controls"];   // one line, truncating: the card's width does not move
 +    _sizeName.text = hasSelection ? @"Size" : @"All Size";
 +    _size.value = (float)fmax(_size.minimumValue, fmin(_size.maximumValue, scale));
 +    _opacity.value = (float)fmax(_opacity.minimumValue, fmin(_opacity.maximumValue, opacity));
@@ -344,9 +351,7 @@ index 9860743..5295666 100644
 +    _editMacroBtn.hidden = !isMacro;
 +    _deleteMacroBtn.hidden = !isMacro;
 +    _addMacroBtn.enabled = !full;
-+    UIButtonConfiguration *ac = _addMacroBtn.configuration;
-+    ac.title = full ? @"Max 12" : @"+ Macro";
-+    _addMacroBtn.configuration = ac;
++    _addMacroBtn.configuration = edit_flat_title(_addMacroBtn.configuration, full ? @"Max 12" : @"+ Macro", 13);
 +    [self showValues];
 +}
 +- (void)sizeValueTapped {
@@ -369,18 +374,13 @@ index 9860743..5295666 100644
 +    [(DmGamepad *)sv editPlaceCard];
 +}
 +- (CGSize)fittedSizeForWidth:(CGFloat)w {
++    w = fmax(w, 300);   // a card narrower than this is a bad measurement, not a layout: never hand one to the stack
 +    CGSize s = [self systemLayoutSizeFittingSize:CGSizeMake(w, UILayoutFittingCompressedSize.height) withHorizontalFittingPriority:UILayoutPriorityRequired verticalFittingPriority:UILayoutPriorityFittingSizeLevel];
 +    return CGSizeMake(w, ceil(s.height));
 +}
-+// What the words need: the widest row laid out on one line, plus the card's own left and right padding. The caller keeps the card at least
-+// this wide (bounded by the safe area), so a long title or a large text size widens the card instead of stacking a button's letters.
-+- (CGFloat)minimumUsableWidth {
-+    if (_minWidth <= 0) {
-+        NSArray<UIView *> *rows = (_collapsed && _widthRows.count) ? @[_widthRows.firstObject] : _widthRows;   // collapsed: only the title row shows
-+        _minWidth = edit_rows_width(rows) + 28;
-+    }
-+    return _minWidth;
-+}
++// What the words need: the widest row added up from the measured titles, plus the card's own left and right padding (worked out in init).
++// The caller keeps the card at least this wide, bounded by the safe area, so the rows are laid out with room to spare, not squeezed.
++- (CGFloat)minimumUsableWidth { return _minWidth; }
 +// Swallow stray touches on the card's background so they never leak through to controls underneath.
 +- (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { (void)ts; (void)e; }
 +- (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { (void)ts; (void)e; }
@@ -408,8 +408,7 @@ index 9860743..5295666 100644
 +    UIButton *_saveBtn;
 +    UIScrollView *_scroll;
 +    UIStackView *_content;
-+    NSArray<UIView *> *_widthRows;   // header, mode row and actions: the rows whose words sit side by side
-+    CGFloat _minWidth;
++    CGFloat _minWidth;   // the width its widest row needs, worked out once from the measured words
 +}
 +static const struct { int bit; const char *title; } k_macro_grid[16] = {
 +    {B_A, "A"}, {B_B, "B"}, {B_X, "X"}, {B_Y, "Y"},
@@ -431,9 +430,10 @@ index 9860743..5295666 100644
 +        self.layer.shadowColor = UIColor.blackColor.CGColor; self.layer.shadowOpacity = 0.5; self.layer.shadowRadius = 16; self.layer.shadowOffset = CGSizeMake(0, 6);
 +        __weak DmPadMacroCard *weak = self;
 +
-+        UILabel *title = edit_label(editing ? @"Edit Macro Button" : @"New Macro Button", 15, UIFontWeightBold, 1);
-+        _previewBadge = edit_label(@"Pick buttons", 12, UIFontWeightBold, 1);
-+        _previewBadge.textAlignment = NSTextAlignmentCenter; _previewBadge.numberOfLines = 1;
++        NSString *titleText = editing ? @"Edit Macro Button" : @"New Macro Button";
++        UILabel *title = edit_flat_label(edit_label(titleText, 15, UIFontWeightBold, 1));
++        _previewBadge = edit_flat_label(edit_label(@"Pick buttons", 12, UIFontWeightBold, 1));
++        _previewBadge.textAlignment = NSTextAlignmentCenter;
 +        _previewBadge.layer.cornerRadius = 11; _previewBadge.layer.masksToBounds = YES; _previewBadge.layer.borderWidth = 1;
 +        [_previewBadge.heightAnchor constraintEqualToConstant:24].active = YES;
 +        [_previewBadge.widthAnchor constraintGreaterThanOrEqualToConstant:76].active = YES;
@@ -448,14 +448,13 @@ index 9860743..5295666 100644
 +            for (int c = 0; c < 4; c++) {
 +                int idx = r * 4 + c, bit = k_macro_grid[idx].bit;
 +                UIButtonConfiguration *cfg = [UIButtonConfiguration tintedButtonConfiguration];
-+                cfg.title = @(k_macro_grid[idx].title);
 +                cfg.buttonSize = UIButtonConfigurationSizeSmall;
 +                cfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-+                cfg = edit_flat_title(cfg, 14);
++                cfg = edit_flat_title(cfg, @(k_macro_grid[idx].title), 14);
 +                UIButton *b = [UIButton buttonWithConfiguration:cfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) {
 +                    (void)a; [weak toggleBit:bit];
 +                }]];
-+                edit_one_line(b);
++                edit_one_line(b, edit_btn_width(@(k_macro_grid[idx].title), 14));
 +                [b.heightAnchor constraintEqualToConstant:30].active = YES;
 +                _gridBtn[idx] = b;
 +                [cols addObject:b];
@@ -468,12 +467,16 @@ index 9860743..5295666 100644
 +        grid.axis = UILayoutConstraintAxisVertical; grid.spacing = 5;
 +
 +        // Mode selector (Hold / Toggle / Turbo) + optional custom label field.
-+        _modeSeg = [[UISegmentedControl alloc] initWithItems:@[@"Hold", @"Toggle", @"Turbo"]];
-+        [_modeSeg setTitleTextAttributes:@{NSFontAttributeName: edit_capped_font(13, UIFontWeightMedium)} forState:UIControlStateNormal];       // capped like the rest of the card:
-+        [_modeSeg setTitleTextAttributes:@{NSFontAttributeName: edit_capped_font(13, UIFontWeightSemibold)} forState:UIControlStateSelected];   // a large text size must not clip the three words
++        NSArray<NSString *> *modes = @[@"Hold", @"Toggle", @"Turbo"];
++        _modeSeg = [[UISegmentedControl alloc] initWithItems:modes];
++        [_modeSeg setTitleTextAttributes:@{NSFontAttributeName: [UIFont systemFontOfSize:13 weight:UIFontWeightMedium]} forState:UIControlStateNormal];       // a plain fixed font, like
++        [_modeSeg setTitleTextAttributes:@{NSFontAttributeName: [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold]} forState:UIControlStateSelected];   // the rest of the card
 +        _modeSeg.selectedSegmentIndex = (mode >= DM_PAD_MACRO_HOLD && mode <= DM_PAD_MACRO_TURBO) ? mode : DM_PAD_MACRO_HOLD;
 +        [_modeSeg addTarget:self action:@selector(refreshState) forControlEvents:UIControlEventValueChanged];
 +        [_modeSeg.heightAnchor constraintEqualToConstant:30].active = YES;
++        CGFloat segNeed = 0;   // the three words side by side, each with its segment padding: the control is never narrower
++        for (NSString *m in modes) segNeed += edit_text_width(m, [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold]) + 26;
++        [_modeSeg.widthAnchor constraintGreaterThanOrEqualToConstant:ceil(segNeed)].active = YES;
 +
 +        _labelField = [UITextField new];
 +        _labelField.placeholder = @"Auto label";
@@ -500,53 +503,60 @@ index 9860743..5295666 100644
 +
 +        // Bottom actions: Clear, optional Delete, Cancel, Add / Save.
 +        UIButtonConfiguration *clrCfg = [UIButtonConfiguration plainButtonConfiguration];
-+        clrCfg.title = @"Clear"; clrCfg.buttonSize = UIButtonConfigurationSizeSmall; clrCfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-+        clrCfg.contentInsets = NSDirectionalEdgeInsetsMake(5, 11, 5, 11);
-+        clrCfg = edit_flat_title(clrCfg, 13);
++        clrCfg.buttonSize = UIButtonConfigurationSizeSmall; clrCfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
++        clrCfg = edit_flat_title(clrCfg, @"Clear", 13);
 +        clrCfg.baseForegroundColor = [UIColor colorWithWhite:0.72 alpha:1];
 +        UIButton *clearBtn = [UIButton buttonWithConfiguration:clrCfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) {
 +            (void)a; [weak clearBits];
 +        }]];
-+        edit_one_line(clearBtn);
++        edit_one_line(clearBtn, edit_btn_width(@"Clear", 13));
 +
 +        NSMutableArray<UIView *> *actViews = [NSMutableArray arrayWithObject:clearBtn];
++        CGFloat delNeed = 0;
 +        if (editing) {
 +            UIButtonConfiguration *delCfg = [UIButtonConfiguration plainButtonConfiguration];
-+            delCfg.title = @"Delete"; delCfg.buttonSize = UIButtonConfigurationSizeSmall; delCfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-+            delCfg.contentInsets = NSDirectionalEdgeInsetsMake(5, 11, 5, 11);
-+            delCfg = edit_flat_title(delCfg, 13);
++            delCfg.buttonSize = UIButtonConfigurationSizeSmall; delCfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
++            delCfg = edit_flat_title(delCfg, @"Delete", 13);
 +            delCfg.baseForegroundColor = [UIColor colorWithRed:1 green:0.45 blue:0.4 alpha:1];
 +            UIButton *delBtn = [UIButton buttonWithConfiguration:delCfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) {
 +                (void)a; [weak endEditing:YES]; if (weak.onDelete) weak.onDelete();
 +            }]];
-+            edit_one_line(delBtn);
++            delNeed = edit_btn_width(@"Delete", 13) + 6;
++            edit_one_line(delBtn, edit_btn_width(@"Delete", 13));
 +            [actViews addObject:delBtn];
 +        }
 +        UIView *bSpacer = [UIView new]; [bSpacer setContentHuggingPriority:UILayoutPriorityDefaultLow - 1 forAxis:UILayoutConstraintAxisHorizontal];
 +        [actViews addObject:bSpacer];
 +
 +        UIButtonConfiguration *canCfg = [UIButtonConfiguration tintedButtonConfiguration];
-+        canCfg.title = @"Cancel"; canCfg.buttonSize = UIButtonConfigurationSizeSmall; canCfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-+        canCfg.contentInsets = NSDirectionalEdgeInsetsMake(5, 11, 5, 11);
-+        canCfg = edit_flat_title(canCfg, 13);
++        canCfg.buttonSize = UIButtonConfigurationSizeSmall; canCfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
++        canCfg = edit_flat_title(canCfg, @"Cancel", 13);
 +        UIButton *canBtn = [UIButton buttonWithConfiguration:canCfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) {
 +            (void)a; [weak endEditing:YES]; if (weak.onCancel) weak.onCancel();
 +        }]];
-+        edit_one_line(canBtn);
++        edit_one_line(canBtn, edit_btn_width(@"Cancel", 13));
 +        [actViews addObject:canBtn];
 +
++        NSString *saveText = editing ? @"Save" : @"Add";
 +        UIButtonConfiguration *savCfg = [UIButtonConfiguration filledButtonConfiguration];
-+        savCfg.title = editing ? @"Save" : @"Add"; savCfg.buttonSize = UIButtonConfigurationSizeSmall; savCfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-+        savCfg.contentInsets = NSDirectionalEdgeInsetsMake(5, 11, 5, 11);
-+        savCfg = edit_flat_title(savCfg, 13);
++        savCfg.buttonSize = UIButtonConfigurationSizeSmall; savCfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
++        savCfg = edit_flat_title(savCfg, saveText, 13);
 +        _saveBtn = [UIButton buttonWithConfiguration:savCfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) {
 +            (void)a; [weak commitSave];
 +        }]];
-+        edit_one_line(_saveBtn);
++        edit_one_line(_saveBtn, edit_btn_width(saveText, 13));
 +        [actViews addObject:_saveBtn];
 +        UIStackView *actions = [[UIStackView alloc] initWithArrangedSubviews:actViews];
 +        actions.axis = UILayoutConstraintAxisHorizontal; actions.spacing = 6; actions.alignment = UIStackViewAlignmentCenter;
-+        _widthRows = @[header, modeRow, actions];
++
++        // The width this card asks for: its widest row, added up from the measured words (see the note above DmPadEditCard's helpers).
++        CGFloat headerNeed = edit_text_width(titleText, [UIFont systemFontOfSize:15 weight:UIFontWeightBold]) + 8 + 132;   // 132: the preview badge at its budgeted width
++        CGFloat modeNeed = ceil(segNeed) + 8 + 118;                                                                       // the three modes and the label field
++        CGFloat cellNeed = 0;   // the picker fills its four columns equally, so every cell is as wide as the widest legend
++        for (int i = 0; i < 16; i++) cellNeed = fmax(cellNeed, edit_btn_width(@(k_macro_grid[i].title), 14));
++        CGFloat gridNeed = 4 * cellNeed + 3 * 6;
++        CGFloat actionsNeed = edit_btn_width(@"Clear", 13) + 6 + delNeed + 16 + edit_btn_width(@"Cancel", 13) + 6 + edit_btn_width(saveText, 13);
++        _minWidth = ceil(fmax(fmax(headerNeed, modeNeed), fmax(gridNeed, actionsNeed))) + 28;
 +
 +        _content = [[UIStackView alloc] initWithArrangedSubviews:@[header, grid, modeRow, actions]];
 +        _content.axis = UILayoutConstraintAxisVertical; _content.spacing = 8; _content.translatesAutoresizingMaskIntoConstraints = NO;
@@ -603,16 +613,14 @@ index 9860743..5295666 100644
 +    for (int i = 0; i < 16; i++) {
 +        BOOL on = ((_mask >> k_macro_grid[i].bit) & 1ull) != 0;
 +        UIButtonConfiguration *c = on ? [UIButtonConfiguration filledButtonConfiguration] : [UIButtonConfiguration tintedButtonConfiguration];
-+        c.title = @(k_macro_grid[i].title); c.buttonSize = UIButtonConfigurationSizeSmall; c.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-+        c = edit_flat_title(c, 14);   // a fresh configuration drops the pinned font: put it back
++        c.buttonSize = UIButtonConfigurationSizeSmall; c.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
++        c = edit_flat_title(c, @(k_macro_grid[i].title), 14);   // a fresh configuration drops the one-line title: put it back
 +        if (on) { c.baseBackgroundColor = accent; c.baseForegroundColor = UIColor.blackColor; }
 +        else { c.baseBackgroundColor = [UIColor colorWithWhite:1 alpha:0.14]; c.baseForegroundColor = [UIColor colorWithWhite:0.92 alpha:1]; }
 +        _gridBtn[i].configuration = c;
 +    }
 +    NSString *lbl = [self computedLabel];
-+    NSString *badge = lbl.length ? [NSString stringWithFormat:@"  %@  ", lbl] : @"  Pick buttons  ";
-+    if (![badge isEqualToString:_previewBadge.text]) _minWidth = 0;   // the preview badge grows with the label: measure the rows again
-+    _previewBadge.text = badge;
++    _previewBadge.text = lbl.length ? [NSString stringWithFormat:@"  %@  ", lbl] : @"  Pick buttons  ";   // one line, truncating: the card keeps its width
 +    _previewBadge.textColor = lbl.length ? accent : [UIColor colorWithWhite:0.6 alpha:1];
 +    _previewBadge.backgroundColor = [accent colorWithAlphaComponent:lbl.length ? 0.18 : 0.06];
 +    _previewBadge.layer.borderColor = [accent colorWithAlphaComponent:lbl.length ? 0.6 : 0.18].CGColor;
@@ -629,13 +637,11 @@ index 9860743..5295666 100644
 +    if (self.onSave) self.onSave(_mask, mode, lbl);
 +}
 +- (CGSize)fittedSizeForWidth:(CGFloat)w maxHeight:(CGFloat)maxH {
++    w = fmax(w, 300);
 +    CGSize s = [_content systemLayoutSizeFittingSize:CGSizeMake(w - 28, UILayoutFittingCompressedSize.height) withHorizontalFittingPriority:UILayoutPriorityRequired verticalFittingPriority:UILayoutPriorityFittingSizeLevel];
 +    return CGSizeMake(w, fmin(ceil(s.height) + 24, maxH));
 +}
-+- (CGFloat)minimumUsableWidth {   // as wide as its widest one-line row needs: Clear, Delete, Cancel and Add never stack their letters
-+    if (_minWidth <= 0) _minWidth = edit_rows_width(_widthRows) + 28;
-+    return _minWidth;
-+}
++- (CGFloat)minimumUsableWidth { return _minWidth; }   // as wide as its widest row needs: Clear, Delete, Cancel and Add never stack their letters
 +- (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { (void)ts; (void)e; [self endEditing:YES]; }
 +- (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { (void)ts; (void)e; }
 +- (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { (void)ts; (void)e; }
@@ -664,7 +670,7 @@ index 9860743..5295666 100644
      CALayer *_hint; CATextLayer *_hintText; NSString *_hintWords;   // the 3D layout's right-stick hint: words only, once per launch (see "The right-stick hint")
      DmMenuButton *_menu;                           // opens the in-game menu (GameMenu.swift)
      UIView *_padHint; CAShapeLayer *_padHintBg;    // controller quit hint below _menu: shown once per launch with keycap pills, fades with _menu
-@@ -182,12 +744,25 @@ static void pads_start(void);   // Physical controllers, below
+@@ -182,12 +750,25 @@ static void pads_start(void);   // Physical controllers, below
      DmLayout _layout;
      DmPadOptions _opts;                            // the player's options from the environment (DM_TOUCH_SIZE, DM_TOUCH_STICK, DM_TOUCH_LAYOUT)
      DmPadLayout _arrangement;                      // DM_TOUCH_LAYOUT, which _opts.layout points to
@@ -690,7 +696,15 @@ index 9860743..5295666 100644
  static CAShapeLayer *shape(CALayer *parent) {
      CAShapeLayer *l = [CAShapeLayer layer];
      l.fillColor = k_idle.CGColor; l.strokeColor = k_line.CGColor; l.lineWidth = 1.5;
-@@ -213,7 +788,8 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+@@ -197,6 +778,7 @@ static CAShapeLayer *shape(CALayer *parent) {
+ static CATextLayer *label(CALayer *parent, NSString *s) {
+     CATextLayer *t = [CATextLayer layer];
+     t.string = s; t.alignmentMode = kCAAlignmentCenter; t.foregroundColor = k_text.CGColor;
++    t.wrapped = NO;   // a key legend stays on its one line whichever way the device is held (placeLabel gives it the room)
+     [parent addSublayer:t]; return t;
+ }
+ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   // keys shown only in the 3D layout
+@@ -213,7 +795,8 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
          const char *arrangement = getenv("DM_TOUCH_LAYOUT");
          if (!dm_pad_layout_parse(arrangement, &_arrangement)) LOG("front end: DM_TOUCH_LAYOUT ignored (not a layout the engine reads, %zu characters): every control keeps its place", strlen(arrangement));
          else if (dm_pad_layout_count(&_arrangement)) LOG("front end: touch controls arranged by the player (DM_TOUCH_LAYOUT, %d moved over every layout)", dm_pad_layout_count(&_arrangement));
@@ -700,7 +714,7 @@ index 9860743..5295666 100644
          [self registerForTraitChanges:@[UITraitDisplayScale.class] withHandler:^(id<UITraitEnvironment> environment, UITraitCollection *previous) {
              [(UIView *)environment setNeedsLayout];
          }];
-@@ -228,8 +804,15 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+@@ -228,8 +811,15 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
              // each colour carries its own low opacity instead of lowering the whole view's alpha (that would add an off-screen pass for the full-screen layer)
              k_idle = [UIColor colorWithWhite:1 alpha:0.14]; k_on = [UIColor colorWithWhite:1 alpha:0.45]; k_line = [UIColor colorWithWhite:1 alpha:0.38];
              k_ringFill = [UIColor colorWithWhite:1 alpha:0.06]; k_text = [UIColor colorWithWhite:1 alpha:0.6]; k_textOn = [UIColor colorWithWhite:0 alpha:0.7];
@@ -716,7 +730,7 @@ index 9860743..5295666 100644
          _ring = shape(_controls); _ring.fillColor = k_ringFill.CGColor;
          _knob = shape(_controls);
          CAShapeLayer *in = [CAShapeLayer layer]; in.fillColor = nil; in.strokeColor = k_line.CGColor; in.lineWidth = 1.5;   // inner ring of the knob
-@@ -239,6 +822,11 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+@@ -239,6 +829,11 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
              _key[b] = shape(_controls);
              if (names[b]) _label[b] = label(_key[b], names[b]);   // the D-pad arms carry no label
          }
@@ -728,7 +742,15 @@ index 9860743..5295666 100644
          _menu = [DmMenuButton buttonWithType:UIButtonTypeCustom];
          _menu.backgroundColor = k_idle; _menu.layer.borderColor = k_line.CGColor; _menu.layer.borderWidth = 1.5;
          _menu.layer.shadowColor = UIColor.blackColor.CGColor; _menu.layer.shadowOpacity = 0.2; _menu.layer.shadowRadius = 3; _menu.layer.shadowOffset = CGSizeMake(0, 1);
-@@ -276,10 +864,20 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+@@ -259,6 +854,7 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+         _hintWords = hint ? [NSString stringWithUTF8String:hint] : @"Right stick: drag here";
+         _hint = [CALayer layer]; _hint.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5].CGColor; _hint.opacity = 0; _hint.hidden = YES;
+         _hintText = [CATextLayer layer]; _hintText.string = _hintWords; _hintText.alignmentMode = kCAAlignmentCenter;
++        _hintText.wrapped = NO; _hintText.truncationMode = kCATruncationEnd;   // the hint reads across, never down, however the device is held
+         _hintText.foregroundColor = [UIColor colorWithWhite:1 alpha:0.9].CGColor; [_hint addSublayer:_hintText]; [_controls addSublayer:_hint];
+         NSNumber *saved = [NSUserDefaults.standardUserDefaults objectForKey:k_layout_key];
+         int l = saved ? (int)saved.integerValue : dm_profile()->pad_layout;
+@@ -276,10 +872,20 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
      }
      return self;
  }
@@ -749,7 +771,7 @@ index 9860743..5295666 100644
      [CATransaction commit];
  }
  - (int)padLayout { return _tap ? 2 : _full ? 1 : 0; }
-@@ -305,7 +903,10 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+@@ -305,7 +911,10 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
          && _layout.topSafeOnly == layout.topSafeOnly && _layout.customControlsFullBounds == layout.customControlsFullBounds
          && _layout.onTV == layout.onTV) return;
      [self reset];   // A finger held across a pose change must not leave a key or game touch stuck.
@@ -760,7 +782,7 @@ index 9860743..5295666 100644
      [self updateControlVisibility];
      [self setNeedsLayout];
  }
-@@ -314,7 +915,7 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+@@ -314,7 +923,7 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
      if (!_geoValid || !CGRectEqualToRect(b, _geoBounds) || !UIEdgeInsetsEqualToEdgeInsets(i, _geoInsets) || _geoFull != _full) {
          _geo = dm_pad_geo(b, i, _layout, _full, _opts);
          _geoBounds = b; _geoInsets = i; _geoFull = _full; _geoValid = YES;
@@ -769,7 +791,7 @@ index 9860743..5295666 100644
              _loggedDropped = _geo.dropped;
              NSMutableArray<NSString *> *names = [NSMutableArray array];
              for (int c = 0; c < DM_PAD_C_N; c++) if (_geo.dropped & (1u << c)) [names addObject:@(dm_pad_control_names[c])];
-@@ -354,9 +955,28 @@ static int lockedKey(int c) {   // DmPadGeometry.h's control → the key it pres
+@@ -354,9 +963,28 @@ static int lockedKey(int c) {   // DmPadGeometry.h's control → the key it pres
      if (_tap || _padOff || (_layout.separated && !CGRectContainsPoint(_layout.controls, p))) return YES;
      return dm_pad_menu_takes(self.geo, _full, _layout.separated, p);
  }
@@ -801,7 +823,7 @@ index 9860743..5295666 100644
      return m;
  }
  - (uint64_t)dpadAt:(CGPoint)p {   // 8 directions: 45° each, diagonals press two keys; a small centre circle counts as none
-@@ -379,10 +999,43 @@ static int lockedKey(int c) {   // DmPadGeometry.h's control → the key it pres
+@@ -379,10 +1007,43 @@ static int lockedKey(int c) {   // DmPadGeometry.h's control → the key it pres
  // ---- Touch ----
  - (void)recompute {
      uint64_t face = 0; for (UITouch *t in _faceOf) face |= [_faceOf objectForKey:t].unsignedLongLongValue;
@@ -847,7 +869,7 @@ index 9860743..5295666 100644
      int32_t ax[4] = {0};
      for (int i = 0; i < 2; i++) {
          CGPoint o = [self knobOffset:i]; CGFloat R = [self stickR:i], d = hypot(o.x, o.y), dz = R * K_DEAD;
-@@ -390,16 +1043,17 @@ static int lockedKey(int c) {   // DmPadGeometry.h's control → the key it pres
+@@ -390,16 +1051,17 @@ static int lockedKey(int c) {   // DmPadGeometry.h's control → the key it pres
          CGFloat m = fmin((d - dz) / (R * K_FULL - dz), 1) / d;   // outside the dead zone: 0 rising to full at the full-tilt radius
          ax[i * 2] = (int32_t)lrint(o.x * m * 32767); ax[i * 2 + 1] = (int32_t)lrint(-o.y * m * 32767);   // host: up is positive; rounded so full tilt is exactly 32767
      }
@@ -869,7 +891,7 @@ index 9860743..5295666 100644
      pthread_mutex_unlock(&g_mu);
      publish();
      BOOL stick = _stick[0] != nil;   // only the left stick is drawn: the right one needs no refresh
-@@ -428,6 +1082,7 @@ int front_web_touch(void);
+@@ -428,6 +1090,7 @@ int front_web_touch(void);
  - (BOOL)controlAt:(CGPoint)p {
      if (_padOff || (_layout.separated && !CGRectContainsPoint(_layout.controls, p))) return NO;
      if (_tap) return NO;
@@ -877,7 +899,7 @@ index 9860743..5295666 100644
      if (dm_pad_hit(self.geo, _full, _layout.separated, _tap, !_stick[0], p).kind != DM_PAD_HIT_NONE) return YES;   // the geometry touchesBegan hits with (DmPadGeometry.h)
      return _full && !_stick[1] && [self inRightArea:p];
  }
-@@ -443,12 +1098,29 @@ int front_web_touch(void);
+@@ -443,12 +1106,29 @@ int front_web_touch(void);
      return v;
  }
  - (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
@@ -907,7 +929,7 @@ index 9860743..5295666 100644
          DmPadHit hit = dm_pad_hit(self.geo, _full, _layout.separated, _tap, !_stick[0], p);   // the same geometry the controls are drawn with (the menu button took its own touches, menuTakes)
          if (hit.kind == DM_PAD_HIT_KEY) { [_owner setObject:@(C_BTN | (uint64_t)lockedKey(hit.key) << 8) forKey:t]; continue; }
          if (_tap) { game |= [self gameBegin:t]; continue; }
-@@ -463,6 +1135,7 @@ int front_web_touch(void);
+@@ -463,6 +1143,7 @@ int front_web_touch(void);
      [self recompute];
  }
  - (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
@@ -915,7 +937,7 @@ index 9860743..5295666 100644
      BOOL game = NO;
      for (UITouch *t in ts) {
          uint64_t v = [_owner objectForKey:t].unsignedLongLongValue; int c = (int)(v & 0xff); CGPoint p = [t locationInView:self];
-@@ -485,9 +1158,14 @@ int front_web_touch(void);
+@@ -485,9 +1166,14 @@ int front_web_touch(void);
      if (game) [self pushGame];
      [self recompute];
  }
@@ -933,7 +955,16 @@ index 9860743..5295666 100644
  
  // ---- Shapes ----
  static CGPathRef circlePath(CGPoint c, CGFloat r) { return CGPathCreateWithEllipseInRect(CGRectMake(c.x - r, c.y - r, 2 * r, 2 * r), NULL); }
-@@ -519,46 +1197,519 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
+@@ -515,50 +1201,530 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
+     CTFontRef f = CTFontCreateUIFontForLanguage(kCTFontUIFontEmphasizedSystem, fs, NULL);
+     t.font = f; t.fontSize = fs;
+     CGFloat h = CTFontGetAscent(f) + CTFontGetDescent(f) + CTFontGetLeading(f), w = fs * 3;
++    NSString *s = [t.string isKindOfClass:NSString.class] ? (NSString *)t.string : nil;   // a legend wider than the usual box ("ZR", "L3", a
++    if (s.length) {                                                                       // translated name) gets the room it measures, so
++        UIFont *uf = [UIFont systemFontOfSize:fs weight:UIFontWeightSemibold];            // the text engine never has a reason to break it
++        w = fmax(w, ceil([s sizeWithAttributes:@{NSFontAttributeName: uf}].width) + 4);
++    }
+     t.frame = CGRectMake(c.x - w / 2, c.y - h / 2, w, h);
      CFRelease(f);
  }
  
@@ -943,7 +974,7 @@ index 9860743..5295666 100644
 +    CGSize sz = [text sizeWithAttributes:@{NSFontAttributeName: uf}];
 +    if (sz.width > maxWidth && sz.width > 0) fs = fmax(minFs, fs * (maxWidth / sz.width));
 +    CTFontRef f = CTFontCreateUIFontForLanguage(kCTFontUIFontEmphasizedSystem, fs, NULL);
-+    t.string = text; t.font = f; t.fontSize = fs; t.truncationMode = kCATruncationEnd;
++    t.string = text; t.font = f; t.fontSize = fs; t.truncationMode = kCATruncationEnd; t.wrapped = NO;   // shrink it, then shorten it: never stack it
 +    CGFloat h = CTFontGetAscent(f) + CTFontGetDescent(f) + CTFontGetLeading(f);
 +    t.frame = CGRectMake(c.x - maxWidth / 2, c.y - h / 2, maxWidth, h);
 +    CFRelease(f);
@@ -1442,8 +1473,9 @@ index 9860743..5295666 100644
 +- (void)editPlaceCard {   // inside the safe area; centred the first time
 +    if (!_editCard) return;
 +    CGRect area = UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets); area = CGRectInset(area, 8, 8);
-+    CGFloat want = fmax(392, [_editCard minimumUsableWidth]);   // wider than usual only when the words need it (big text size, long title)
-+    CGSize size = [_editCard fittedSizeForWidth:fmin(want, area.size.width)];
++    CGFloat want = fmax(392, [_editCard minimumUsableWidth]);         // never narrower than the words need (DmPadEditCard's minimumUsableWidth)
++    CGFloat avail = fmax(area.size.width, 300);                       // and never squeezed by an area this view does not have bounds for yet
++    CGSize size = [_editCard fittedSizeForWidth:fmin(want, avail)];
 +    CGPoint centre = _editCardPlaced ? _editCard.center : CGPointMake(CGRectGetMidX(area), CGRectGetMidY(area));
 +    centre.x = fmax(CGRectGetMinX(area) + size.width / 2, fmin(centre.x, CGRectGetMaxX(area) - size.width / 2));
 +    centre.y = fmax(CGRectGetMinY(area) + size.height / 2, fmin(centre.y, CGRectGetMaxY(area) - size.height / 2));
@@ -1454,7 +1486,8 @@ index 9860743..5295666 100644
 +    if (!_macroCard) return;
 +    CGRect area = UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets); area = CGRectInset(area, 8, 8);
 +    CGFloat want = fmax(368, [_macroCard minimumUsableWidth]);
-+    CGSize size = [_macroCard fittedSizeForWidth:fmin(want, area.size.width) maxHeight:fmax(160, area.size.height)];
++    CGFloat avail = fmax(area.size.width, 300);
++    CGSize size = [_macroCard fittedSizeForWidth:fmin(want, avail) maxHeight:fmax(160, area.size.height)];
 +    CGFloat cy = lifted ? CGRectGetMinY(area) + size.height / 2 + 4 : CGRectGetMidY(area);
 +    cy = fmax(CGRectGetMinY(area) + size.height / 2, fmin(cy, CGRectGetMaxY(area) - size.height / 2));
 +    _macroCard.bounds = CGRectMake(0, 0, size.width, size.height);
@@ -1464,7 +1497,7 @@ index 9860743..5295666 100644
  // ---- The right-stick hint ----
  // The 3D layout's right stick is not drawn (it answers anywhere in the right third), and players read the layout as having none (GitHub issues #347, #414).
  // So the first time the 3D layout shows in a launch, a few words say where it is, for two seconds, then fade. Words only: a ring or a knob would read as
-@@ -569,7 +1720,7 @@ static BOOL g_hintShown;   // once per launch
+@@ -569,7 +1735,7 @@ static BOOL g_hintShown;   // once per launch
  - (void)placeHint {
      if (g_hintShown && _hint.hidden) return;
      if (!_full || _tap || _padOff || !_hintWords.length || CGRectIsEmpty(self.bounds)) { if (!_hint.hidden) [self hideHint]; return; }
@@ -1473,7 +1506,7 @@ index 9860743..5295666 100644
      UIFont *font = [UIFont systemFontOfSize:fs weight:UIFontWeightSemibold];
      CGSize t = [_hintWords sizeWithAttributes:@{NSFontAttributeName: font}];
      CGSize box = CGSizeMake(ceil(t.width) + 2 * fs, ceil(t.height) + fs * 0.8);
-@@ -598,10 +1749,25 @@ static BOOL g_hintShown;   // once per launch
+@@ -598,10 +1764,25 @@ static BOOL g_hintShown;   // once per launch
  }
  - (void)safeAreaInsetsDidChange { [super safeAreaInsetsDidChange]; [self setNeedsLayout]; }
  - (void)refresh {   // pressed state → fill, sticks → knob position
@@ -1500,7 +1533,20 @@ index 9860743..5295666 100644
      CGPoint h = self.stickHome, o = [self knobOffset:0];
      _knob.position = CGPointMake(h.x + o.x, h.y + o.y); _knob.fillColor = (_stick[0] ? k_on : k_idle).CGColor;
      [CATransaction commit];
-@@ -833,7 +1999,7 @@ static BOOL pads_slotted(GCController *gone) {
+@@ -786,10 +1967,12 @@ static BOOL pads_slotted(GCController *gone) {
+             [_padHint.layer addSublayer:cap];
+             UILabel *kl = [[UILabel alloc] initWithFrame:cr];
+             kl.font = capFont; kl.textColor = k_text; kl.textAlignment = NSTextAlignmentCenter; kl.text = parts[i];
++            kl.numberOfLines = 1; kl.lineBreakMode = NSLineBreakByClipping;   // the hint is one line of words across the screen, in either orientation
+             [_padHint addSubview:kl];
+         } else {
+             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(cx, 0, w, h)];
+             lbl.font = textFont; lbl.textColor = k_text; lbl.text = parts[i];
++            lbl.numberOfLines = 1; lbl.lineBreakMode = NSLineBreakByClipping;
+             [_padHint addSubview:lbl];
+         }
+         cx += w + gap;
+@@ -833,7 +2016,7 @@ static BOOL pads_slotted(GCController *gone) {
      if (_padOff && !_layout.onTV) [self wakeMenu];
  }
  - (void)updateControlVisibility {
@@ -1509,7 +1555,26 @@ index 9860743..5295666 100644
      if (_padOff && _layout.onTV) {
          ++_menuGen; [_menu.layer removeAllAnimations];
          _menu.alpha = 1; _menu.hidden = YES;
-@@ -961,6 +2127,8 @@ void dm_gamepad_touch_feedback(bool on) { [g_view setTouchFeedback:on]; }
+@@ -874,12 +2057,16 @@ static int cp_waiting(void) {   // connected controllers that are no player yet
+ }
+ static UILabel *cp_label(const char *text, CGFloat size, UIFontWeight w, CGFloat alpha) {
+     UILabel *l = [UILabel new]; l.text = @(text); l.font = [UIFont systemFontOfSize:size weight:w]; l.textColor = [UIColor colorWithWhite:1 alpha:alpha];
+-    l.numberOfLines = 0; l.textAlignment = NSTextAlignmentCenter; return l;
++    l.numberOfLines = 0; l.lineBreakMode = NSLineBreakByWordWrapping;   // a sentence may take several lines; a word is never split down them
++    l.adjustsFontSizeToFitWidth = NO; l.textAlignment = NSTextAlignmentCenter; return l;
+ }
+ static UIButton *cp_button(const char *title, SEL action, int primary) {
+     UIButtonConfiguration *cfg = primary ? UIButtonConfiguration.filledButtonConfiguration : UIButtonConfiguration.grayButtonConfiguration;
+-    cfg.title = @(title); cfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule; cfg.buttonSize = UIButtonConfigurationSizeLarge;
++    cfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule; cfg.buttonSize = UIButtonConfigurationSizeLarge;
++    cfg = edit_flat_title(cfg, @(title), 17);   // the two buttons share the card's width equally: neither may turn its word into a column
++    cfg.contentInsets = NSDirectionalEdgeInsetsMake(13, 20, 13, 20);   // back to a large button's padding (edit_flat_title sets the cards')
+     UIButton *b = [UIButton buttonWithConfiguration:cfg primaryAction:nil];
++    edit_one_line(b, edit_text_width(@(title), edit_btn_font(17)) + 44);
+     [b addTarget:g_cp_target action:action forControlEvents:UIControlEventTouchUpInside]; return b;
+ }
+ static void cp_show(void) {   // the card once per prompt; its count and its Done button follow each step
+@@ -961,6 +2148,8 @@ void dm_gamepad_touch_feedback(bool on) { [g_view setTouchFeedback:on]; }
  int dm_pad_layout(void) { return g_view ? [g_view padLayout] : 0; }
  bool dm_pad_layout_offered(int layout) { return layout == 0 || layout == 1 || (layout == 2 && dm_opmode() == 0); }
  void dm_pad_layout_set(int layout) { [g_view setPadLayout:layout]; }
@@ -1518,7 +1583,7 @@ index 9860743..5295666 100644
  void dm_gamepad_pads_read(void) {   // front_ios.m: the quit prompt closed, the game reads every controller as it is now (a button held through it counts again)
      if (g_merge) { for (GCController *c in GCController.controllers) if (c.extendedGamepad) read_pad(c.extendedGamepad); }
      else for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p].extendedGamepad) read_pad(g_held[p].extendedGamepad);
-@@ -981,13 +2149,17 @@ void dm_gamepad_teardown(void) {
+@@ -981,13 +2170,17 @@ void dm_gamepad_teardown(void) {
          if (@available(iOS 27.0, *)) g_motion.deviceMotionBody = nil;
          g_motion = nil;
      }
@@ -1541,7 +1606,7 @@ index 9860743..5295666 100644
      for (GCController *c in GCController.controllers) {
          c.extendedGamepad.valueChangedHandler = nil;
          c.extendedGamepad.buttonHome.pressedChangedHandler = nil;
-@@ -998,4 +2170,7 @@ void dm_gamepad_teardown(void) {
+@@ -998,4 +2191,7 @@ void dm_gamepad_teardown(void) {
          g_held[p] = nil;
      }
      k_idle = nil; k_on = nil; k_line = nil; k_ringFill = nil; k_text = nil; k_textOn = nil;
